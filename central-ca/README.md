@@ -7,6 +7,10 @@ on demand by invoking a Lambda with your normal (SSO / role) credentials — so
 onboarding 2000+ users is just an authorized call, and losing a laptop loses
 nothing.
 
+**One stack deploy gets you the entire pipeline** — KMS CA key → issuer Lambda
+→ auto-bootstrapped Root CA cert → Roles Anywhere Trust Anchor → Profile → IAM
+Role — no manual copy-pasting the CA cert between stacks.
+
 The scalable alternative to the laptop-local OpenSSL CA in the parent directory.
 Still no ACM Private CA, still ~$0 (KMS key ≈ $1/mo; Lambda + DynamoDB + S3 are
 pennies at this volume).
@@ -54,7 +58,8 @@ pennies at this volume).
     └─►  S3         (ca-certificate.pem, crl.pem)
                         │
                         ▼
-          Roles Anywhere Trust Anchor  (trusts the CA cert)
+          Roles Anywhere Trust Anchor  (trusts the CA cert — wired automatically,
+          Roles Anywhere Profile        no copy-paste; see Stack layout below)
           Roles Anywhere CRL           (rejects revoked certs)
 ```
 
@@ -85,7 +90,12 @@ code-stack.yml                          (you deploy this — the only manual ste
                                            ├─ CertTable (DynamoDB)
                                            ├─ ArtifactBucket (S3)
                                            ├─ CALambda (built from the in-memory zip)
-                                           └─ CABootstrap → Root CA cert, auto-created
+                                           ├─ CABootstrap → Root CA cert, auto-created
+                                           ├─ ExternalSystemRole (IAM)
+                                           ├─ TrustAnchor  ← X509CertificateData wired
+                                           │                 directly to CABootstrap's
+                                           │                 output, no copy-paste
+                                           └─ Profile
 ```
 
 `code-stack.yml`'s Outputs pass straight through from the nested stack (via
@@ -112,26 +122,34 @@ your branch name differs.
 1. **CloudFormation console** → **Create stack** → **With new resources** →
    upload `central-ca/code-stack.yml` → **Next**.
 2. **Stack name:** `central-ca`.
-3. **Parameters:** leave at defaults (or override `ProjectName`, `CACommonName`, etc.).
+3. **Parameters:** leave at defaults, or override `ProjectName`, `CACommonName`,
+   `IAMPolicyArns` (the policy attached to the role Roles Anywhere sessions
+   assume — default `ReadOnlyAccess`), `SessionDurationSeconds`, etc.
 4. ✅ acknowledge IAM resource creation → **Submit**.
 5. Wait for **CREATE_COMPLETE** (~2–3 min — it's creating a nested stack).
    Everything happens automatically: fetch the code, fetch the infra template,
-   create the CA infra, bootstrap the Root CA cert.
-6. Open the **Outputs** tab → copy **`CACertificatePem`**.
+   create the CA infra, bootstrap the Root CA cert, **and** register it as the
+   Roles Anywhere Trust Anchor with a Profile and IAM Role — one deploy, no
+   second stack, no copy-pasting the CA cert anywhere.
+6. Open the **Outputs** tab → you now have everything: `CACertificatePem`,
+   `TrustAnchorArn`, `ProfileArn`, `RoleArn`.
 
-Verify the CA cert before trusting it (paste it into a file first):
+Verify the CA cert before trusting client certs it signs (paste `CACertificatePem` into a file first):
 ```bash
 openssl x509 -in ca-certificate.pem -text -noout
+openssl verify -CAfile ca-certificate.pem ca-certificate.pem   # self-signature check
 ```
-
-Then register it as the Roles Anywhere **Trust Anchor**: CloudFormation console
-→ Create stack → upload `../cloudformation.yml` → set `CACertificateBody` to
-the pasted cert and `IAMPolicyArns` as needed → deploy. Its Outputs give you
-`TrustAnchorArn` / `ProfileArn` / `RoleArn`.
 
 **Updating the Lambda code later:** push new code/template to GitHub, then
 update the `central-ca` stack with a bumped `CodeVersion` parameter (`v1` →
 `v2`) — that forces both fetches to re-run and the nested stack to update.
+`CABootstrap` is idempotent, so updates never regenerate or invalidate the
+existing CA cert.
+
+> The root [`../cloudformation.yml`](../cloudformation.yml) (Trust Anchor /
+> Profile / Role as a standalone template) is still used by the separate
+> **local-CA** path in the project root — it's independent of this central CA
+> and not something you deploy again here.
 
 ## Onboard a user
 
@@ -143,7 +161,7 @@ the **public** key. You sign it via the Lambda console:
    ```
 2. **Test** → copy the `"certificate"` field from the response → that's
    `alice-certificate.pem`. Send it back to Alice along with the
-   `TrustAnchorArn` / `ProfileArn` / `RoleArn` from the Trust Anchor stack.
+   `TrustAnchorArn` / `ProfileArn` / `RoleArn` from the `central-ca` stack's Outputs.
 
 (`request-cert.sh` in this directory automates both sides via `aws lambda
 invoke` if you'd rather script it than click through the console.)

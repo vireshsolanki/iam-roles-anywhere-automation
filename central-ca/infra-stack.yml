@@ -34,6 +34,18 @@ Parameters:
     Type: String
     Default: 'US'
 
+  SessionDurationSeconds:
+    Type: Number
+    Default: 3600
+    MinValue: 900
+    MaxValue: 43200
+    Description: 'Maximum Roles Anywhere session duration in seconds (15 min to 12 hours)'
+
+  IAMPolicyArns:
+    Type: CommaDelimitedList
+    Default: 'arn:aws:iam::aws:policy/ReadOnlyAccess'
+    Description: 'Comma-separated list of IAM policy ARNs to attach to the role that Roles Anywhere sessions assume'
+
 Resources:
   # ── The CA private key: lives in KMS, cannot be exported ────────────────────
   CAKey:
@@ -157,6 +169,59 @@ Resources:
       ServiceToken: !GetAtt CALambda.Arn
       Days: 3650
 
+  # ── Roles Anywhere trust chain, wired straight to the auto-bootstrapped cert
+  # No manual copy-paste of the CA cert into a second stack — this stack IS
+  # the complete pipeline: KMS CA → issuer Lambda → Trust Anchor → Profile → Role.
+  ExternalSystemRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-ExternalSystemRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: rolesanywhere.amazonaws.com
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
+              - sts:SetSourceIdentity
+      ManagedPolicyArns: !Ref IAMPolicyArns
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-ExternalSystemRole'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  TrustAnchor:
+    Type: AWS::RolesAnywhere::TrustAnchor
+    Properties:
+      Name: !Sub '${ProjectName}-TrustAnchor'
+      Enabled: true
+      Source:
+        SourceType: CERTIFICATE_BUNDLE
+        SourceData:
+          X509CertificateData: !GetAtt CABootstrap.CACertificate
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-TrustAnchor'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  Profile:
+    Type: AWS::RolesAnywhere::Profile
+    Properties:
+      Name: !Sub '${ProjectName}-Profile'
+      Enabled: true
+      DurationSeconds: !Ref SessionDurationSeconds
+      RoleArns:
+        - !GetAtt ExternalSystemRole.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-Profile'
+        - Key: ManagedBy
+          Value: CloudFormation
+
 Outputs:
   LambdaName:
     Description: 'Issuer Lambda name — invoke to sign/revoke user certificates'
@@ -177,3 +242,15 @@ Outputs:
   CertTableName:
     Description: 'DynamoDB certificate index'
     Value: !Ref CertTable
+
+  TrustAnchorArn:
+    Description: 'Roles Anywhere Trust Anchor ARN'
+    Value: !GetAtt TrustAnchor.TrustAnchorArn
+
+  ProfileArn:
+    Description: 'Roles Anywhere Profile ARN'
+    Value: !GetAtt Profile.ProfileArn
+
+  RoleArn:
+    Description: 'IAM Role ARN that Roles Anywhere sessions assume'
+    Value: !GetAtt ExternalSystemRole.Arn

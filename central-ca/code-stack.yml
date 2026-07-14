@@ -46,6 +46,18 @@ Parameters:
     Type: String
     Default: 'US'
 
+  SessionDurationSeconds:
+    Type: Number
+    Default: 3600
+    MinValue: 900
+    MaxValue: 43200
+    Description: 'Maximum Roles Anywhere session duration in seconds (15 min to 12 hours)'
+
+  IAMPolicyArns:
+    Type: CommaDelimitedList
+    Default: 'arn:aws:iam::aws:policy/ReadOnlyAccess'
+    Description: 'Comma-separated list of IAM policy ARNs to attach to the role that Roles Anywhere sessions assume'
+
 Resources:
   # ── Staging bucket: holds the fetched lambda.zip and infra-stack.yml ────────
   CodeBucket:
@@ -168,6 +180,8 @@ Resources:
         CACommonName: !Ref CACommonName
         CAOrg: !Ref CAOrg
         CACountry: !Ref CACountry
+        SessionDurationSeconds: !Ref SessionDurationSeconds
+        IAMPolicyArns: !Join [',', !Ref IAMPolicyArns]
 
 Outputs:
   LambdaName:
@@ -175,7 +189,7 @@ Outputs:
     Value: !GetAtt InfraStack.Outputs.LambdaName
 
   CACertificatePem:
-    Description: 'Root CA certificate PEM — paste this into ../cloudformation.yml CACertificateBody'
+    Description: 'Root CA certificate PEM (also already registered as the Trust Anchor below — no manual copy-paste needed)'
     Value: !GetAtt InfraStack.Outputs.CACertificatePem
 
   CAKeyId:
@@ -189,3 +203,15 @@ Outputs:
   CertTableName:
     Description: 'DynamoDB certificate index'
     Value: !GetAtt InfraStack.Outputs.CertTableName
+
+  TrustAnchorArn:
+    Description: 'Roles Anywhere Trust Anchor ARN — use when issuing/using client certificates'
+    Value: !GetAtt InfraStack.Outputs.TrustAnchorArn
+
+  ProfileArn:
+    Description: 'Roles Anywhere Profile ARN'
+    Value: !GetAtt InfraStack.Outputs.ProfileArn
+
+  RoleArn:
+    Description: 'IAM Role ARN that Roles Anywhere sessions assume'
+    Value: !GetAtt InfraStack.Outputs.RoleArn
