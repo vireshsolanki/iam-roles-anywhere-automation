@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'Central CA — orchestrator stack. This is the ONLY template you deploy by hand. It fetches lambda.zip and infra-stack.yml from GitHub into S3, then creates infra-stack.yml as a nested stack. No manual S3 upload, no manual Lambda test events.'
+Description: 'Central CA — orchestrator stack. This is the ONLY template you deploy by hand. It fetches handler.py + kms_ca.py from GitHub, zips them in-memory, and fetches infra-stack.yml, staging everything in S3, then creates infra-stack.yml as a nested stack. No zip file in the repo, no manual S3 upload, no manual Lambda test events.'
 
 Parameters:
   ProjectName:
@@ -13,10 +13,15 @@ Parameters:
     AllowedPattern: '^[a-z0-9][a-z0-9.-]{1,40}$'
     Description: 'Lowercase prefix for the artifact S3 bucket (S3 names must be lowercase)'
 
-  CodeSourceUrl:
+  HandlerSourceUrl:
     Type: String
-    Default: 'https://raw.githubusercontent.com/vireshsolanki/iam-roles-anywhere-automation/main/central-ca/lambda.zip'
-    Description: 'Raw GitHub URL to lambda.zip (handler.py + kms_ca.py)'
+    Default: 'https://raw.githubusercontent.com/vireshsolanki/iam-roles-anywhere-automation/main/central-ca/lambda/handler.py'
+    Description: 'Raw GitHub URL to handler.py — fetched and zipped in-memory at deploy time, no zip file lives in the repo'
+
+  KmsCaSourceUrl:
+    Type: String
+    Default: 'https://raw.githubusercontent.com/vireshsolanki/iam-roles-anywhere-automation/main/central-ca/lambda/kms_ca.py'
+    Description: 'Raw GitHub URL to kms_ca.py'
 
   InfraTemplateUrl:
     Type: String
@@ -53,10 +58,14 @@ Resources:
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
 
-  # ── Generic fetcher: downloads a URL into S3. Tiny (<4096 chars), so it can
-  # be inlined directly — reused for both the Lambda zip and the nested
-  # stack's template body (nested-stack TemplateURL must point to S3, not a
-  # plain HTTPS/GitHub URL, so the template itself has to be staged too).
+  # ── Generic fetcher: downloads file(s) into S3. Tiny (<4096 chars), so it
+  # can be inlined directly. Two modes:
+  #   Mode=zip  : download multiple source files and zip them in-memory
+  #               (used for the Lambda's .py source — no .zip file lives in
+  #               the repo, only plain source)
+  #   (default) : copy a single URL's bytes straight through (used for the
+  #               nested stack's template body — TemplateURL must point to
+  #               S3, not a plain GitHub URL, so the template is staged too)
   FetcherRole:
     Type: AWS::IAM::Role
     Properties:
@@ -89,7 +98,7 @@ Resources:
       Role: !GetAtt FetcherRole.Arn
       Code:
         ZipFile: |
-          import json, urllib.request, boto3
+          import json, urllib.request, boto3, zipfile, io
           s3 = boto3.client('s3')
 
           def handler(event, context):
@@ -98,7 +107,14 @@ Resources:
               pid = event.get('PhysicalResourceId') or 'code-fetch'
               try:
                   if rt in ('Create', 'Update'):
-                      data = urllib.request.urlopen(props['SourceUrl']).read()
+                      if props.get('Mode') == 'zip':
+                          buf = io.BytesIO()
+                          with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+                              for name, url in props['Files'].items():
+                                  zf.writestr(name, urllib.request.urlopen(url).read())
+                          data = buf.getvalue()
+                      else:
+                          data = urllib.request.urlopen(props['SourceUrl']).read()
                       s3.put_object(Bucket=props['Bucket'], Key=props['Key'], Body=data)
                   _send(event, context, 'SUCCESS', pid)
               except Exception as exc:
@@ -121,7 +137,10 @@ Resources:
     Type: Custom::FetchZip
     Properties:
       ServiceToken: !GetAtt FetcherFunction.Arn
-      SourceUrl: !Ref CodeSourceUrl
+      Mode: zip
+      Files:
+        handler.py: !Ref HandlerSourceUrl
+        kms_ca.py: !Ref KmsCaSourceUrl
       Bucket: !Ref CodeBucket
       Key: !Sub 'lambda-code-${CodeVersion}.zip'
 

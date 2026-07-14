@@ -6,6 +6,8 @@ client-*/
 *.key
 
 # Build artifacts for the central (KMS) CA Lambda
+# No zip is committed — code-stack.yml fetches handler.py/kms_ca.py as plain
+# source and builds the deployment zip in-memory at deploy time.
 central-ca/packaged.yml
 central-ca/*.zip
 central-ca/ca-certificate.pem

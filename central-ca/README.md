@@ -19,16 +19,18 @@ pennies at this volume).
   credential chain (SSO / IAM role). The IAM permission to invoke the function
   *is* the issuance access control. There is no API Gateway and nothing that
   reads an access-key/secret.
-- **Deploy is pure CloudFormation, console-only, one stack, no manual upload** —
-  the Lambda is 100% Python standard library (a hand-rolled DER encoder in
-  [lambda/kms_ca.py](lambda/kms_ca.py)), so there's nothing to `pip install`.
-  Its combined source (~16KB) is too big to inline in a template directly
-  (CloudFormation caps inline Lambda code at 4096 characters). Two templates
-  split the concerns:
+- **Deploy is pure CloudFormation, console-only, one stack, no zip file
+  anywhere** — the Lambda is 100% Python standard library (a hand-rolled DER
+  encoder in [lambda/kms_ca.py](lambda/kms_ca.py)), so there's nothing to
+  `pip install`. Its combined source (~16KB) is too big to inline in a
+  template directly (CloudFormation caps inline Lambda code at 4096
+  characters). Two templates split the concerns:
   - **[code-stack.yml](code-stack.yml)** — the one you deploy by hand. A tiny
-    (~1KB) inline "fetcher" Lambda downloads `lambda.zip` *and* the infra
-    template body from your GitHub repo into S3 (nested-stack templates must
-    be read from S3, not a plain URL), then creates...
+    (~1.5KB) inline "fetcher" Lambda downloads `handler.py` and `kms_ca.py` as
+    plain source from your GitHub repo, **zips them in-memory**, and uploads
+    that zip to S3 — no `.zip` file is ever committed to the repo. It also
+    fetches the infra template body into S3 (nested-stack templates must be
+    read from S3, not a plain URL), then creates...
   - **[infra-stack.yml](infra-stack.yml)** — the actual CA (KMS, DynamoDB, the
     issuer Lambda, auto-bootstrap) — automatically, as a **nested stack**. You
     never touch S3, never deploy this one directly.
@@ -71,15 +73,18 @@ Four actions, one Lambda ([lambda/handler.py](lambda/handler.py)):
 code-stack.yml                          (you deploy this — the only manual step)
   │
   ├─ CodeBucket                          S3 staging bucket
-  ├─ FetcherFunction (inline, ~1KB)      generic "download URL → S3" Lambda
-  ├─ FetchZip                            fetches lambda.zip from GitHub
-  ├─ FetchInfraTemplate                  fetches infra-stack.yml from GitHub
+  ├─ FetcherFunction (inline, ~1.5KB)    generic "fetch → S3" Lambda, two modes:
+  │                                        Mode=zip: download handler.py + kms_ca.py,
+  │                                          zip them in-memory, upload the zip
+  │                                        (default): copy a URL's bytes straight through
+  ├─ FetchZip                            Mode=zip — builds lambda-code.zip from source
+  ├─ FetchInfraTemplate                  copies infra-stack.yml from GitHub into S3
   │                                       (nested-stack templates must live in S3)
   └─ InfraStack  ───────────────────►   infra-stack.yml (nested, auto-created)
                                            ├─ CAKey (KMS)
                                            ├─ CertTable (DynamoDB)
                                            ├─ ArtifactBucket (S3)
-                                           ├─ CALambda (built from the fetched zip)
+                                           ├─ CALambda (built from the in-memory zip)
                                            └─ CABootstrap → Root CA cert, auto-created
 ```
 
@@ -90,18 +95,18 @@ code-stack.yml                          (you deploy this — the only manual ste
 
 **Prerequisite (one time):** push this repo to GitHub — `lambda/handler.py` and
 `lambda/kms_ca.py` contain no secrets (access to the CA key is controlled by
-IAM, not by anything in the code), so it's safe to host publicly.
+IAM, not by anything in the code), so it's safe to host publicly as plain
+source. No build step, no zip to create — just commit and push the `.py` files.
 ```bash
 git init && git add -A && git commit -m "central CA"
 git remote add origin https://github.com/vireshsolanki/iam-roles-anywhere-automation.git
 git push -u origin main
 ```
-(Rebuild the zip after any code change: `cd central-ca/lambda && zip -j ../lambda.zip handler.py kms_ca.py`, then commit + push.)
 
 `code-stack.yml`'s parameter defaults already point at your repo
-(`vireshsolanki/iam-roles-anywhere-automation`, branch `main`) — adjust the
-`CodeSourceUrl` / `InfraTemplateUrl` parameters at deploy time if your branch
-name differs.
+(`vireshsolanki/iam-roles-anywhere-automation`, branch `main`) — adjust
+`HandlerSourceUrl` / `KmsCaSourceUrl` / `InfraTemplateUrl` at deploy time if
+your branch name differs.
 
 **Deploy:**
 1. **CloudFormation console** → **Create stack** → **With new resources** →
