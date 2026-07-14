@@ -39,16 +39,28 @@
 #   ./request-cert.sh --lambda <IssuerLambdaName> --name <client-name> \
 #       --renew <old-serial> --trust-anchor-arn <arn> --profile-arn <arn> --role-arn <arn>
 #
+# Optional flags:
+#   --aws-profile-name <name>   Name for the ~/.aws/config profile (default:
+#                                "<client-name>-central-ca").
+#   --no-aws-profile             Skip writing to ~/.aws/config entirely.
+#
 # If --trust-anchor-arn/--profile-arn/--role-arn are omitted, only the
 # certificate is issued (no aws_signing_helper setup) — useful if this user
 # gets their own Role/Profile with a different policy (see README.md,
 # "Giving a different user a different policy") and you want to wire up
 # get-credentials.sh yourself with their specific ARNs.
+#
+# Also appends a `credential_process` AWS CLI profile to ~/.aws/config (name
+# defaults to "<client-name>-central-ca", override with --aws-profile-name),
+# so you get `aws --profile <name> ...` working immediately, with the CLI
+# auto-refreshing credentials on every call — no manual export/re-run needed.
+# This ONLY ever appends a new [profile ...] block; it never edits or
+# overwrites an existing one. Skip it entirely with --no-aws-profile.
 
 set -euo pipefail
 
 LAMBDA=""; URL=""; SECRET=""; NAME=""; DAYS=365; HELPER_VERSION="1.4.0"; RENEW_SERIAL=""
-TRUST_ANCHOR_ARN=""; PROFILE_ARN=""; ROLE_ARN=""
+TRUST_ANCHOR_ARN=""; PROFILE_ARN=""; ROLE_ARN=""; AWS_PROFILE_NAME=""; SKIP_AWS_PROFILE="false"
 
 GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
 info() { echo -e "${GREEN}[INFO]${NC} $1"; }
@@ -67,9 +79,12 @@ while [[ $# -gt 0 ]]; do
     --profile-arn)       PROFILE_ARN="$2";      shift 2 ;;
     --role-arn)          ROLE_ARN="$2";         shift 2 ;;
     --helper-version)    HELPER_VERSION="$2";   shift 2 ;;
+    --aws-profile-name)  AWS_PROFILE_NAME="$2"; shift 2 ;;
+    --no-aws-profile)    SKIP_AWS_PROFILE="true"; shift 1 ;;
     *) error "Unknown option: $1" ;;
   esac
 done
+[[ -n "$AWS_PROFILE_NAME" ]] || AWS_PROFILE_NAME="${NAME}-central-ca"
 [[ -n "$NAME" ]] || error "Required: --name <client-name>"
 if [[ -n "$LAMBDA" ]]; then
   MODE="lambda"
@@ -187,6 +202,28 @@ echo "S3 buckets:"
 aws s3 ls
 EOF
 chmod +x "$OUT/test-credentials.sh"
+
+if [[ "$SKIP_AWS_PROFILE" == "true" ]]; then
+  info "Skipping AWS CLI profile setup (--no-aws-profile given)."
+else
+  AWS_CONFIG_FILE="${AWS_CONFIG_FILE:-$HOME/.aws/config}"
+  mkdir -p "$(dirname "$AWS_CONFIG_FILE")"
+  touch "$AWS_CONFIG_FILE"
+  if grep -q "^\[profile ${AWS_PROFILE_NAME}\]" "$AWS_CONFIG_FILE" 2>/dev/null; then
+    warn "Profile '$AWS_PROFILE_NAME' already exists in $AWS_CONFIG_FILE — left untouched."
+    echo "  Use --aws-profile-name <name> to pick a different name, or edit that file manually."
+  else
+    ABS_OUT="$(cd "$OUT" && pwd)"
+    {
+      echo ""
+      echo "[profile ${AWS_PROFILE_NAME}]"
+      echo "credential_process = ${ABS_OUT}/aws_signing_helper credential-process --certificate ${ABS_OUT}/${NAME}-certificate.pem --private-key ${ABS_OUT}/${NAME}-private-key.pem --trust-anchor-arn ${TRUST_ANCHOR_ARN} --profile-arn ${PROFILE_ARN} --role-arn ${ROLE_ARN}"
+    } >> "$AWS_CONFIG_FILE"
+    info "Added profile '$AWS_PROFILE_NAME' to $AWS_CONFIG_FILE (appended only — nothing else in that file was touched)."
+    echo "  Use it with: aws sts get-caller-identity --profile $AWS_PROFILE_NAME"
+    echo "  The CLI auto-refreshes credentials on every call — no manual re-run needed."
+  fi
+fi
 
 info "Full pipeline complete — everything is ready in $OUT/"
 echo "  Run: cd $OUT && ./test-credentials.sh"

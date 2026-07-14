@@ -289,6 +289,22 @@ credentials in one call. Omit the three ARN flags to only issue the
 certificate (useful when you're using the "different policy per user" flow
 above and want to plug in that user's specific Profile/Role ARN yourself).
 
+**It also configures a long-term AWS CLI profile** — appends a
+`credential_process` block to `~/.aws/config` named `<client-name>-central-ca`
+(e.g. `alice-central-ca`), so once it's set up you don't need
+`test-credentials.sh` at all:
+```bash
+aws sts get-caller-identity --profile alice-central-ca
+aws s3 ls --profile alice-central-ca
+```
+The CLI re-invokes `aws_signing_helper` automatically whenever the cached
+credentials near expiry — no manual refresh, works alongside any other
+profiles already in that file. This step **only ever appends** a new
+`[profile ...]` block; it never edits or overwrites an existing one (if a
+profile with that name already exists, it warns and leaves the file
+untouched). Override the name with `--aws-profile-name <name>`, or skip this
+entirely with `--no-aws-profile`.
+
 ## Renew a certificate (admin-only)
 
 Before or after a certificate expires, issue the same identity a fresh one —
