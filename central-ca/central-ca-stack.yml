@@ -17,9 +17,9 @@ Metadata:
           - CACountry
           - CACertValidityDays
       - Label:
-          default: 'Public Endpoint (lets devs request certs with NO AWS credentials)'
+          default: 'Public Endpoint (API Gateway — lets devs request certs with NO AWS credentials)'
         Parameters:
-          - ApiSecret
+          - ApiKeyValue
       - Label:
           default: 'Operations'
         Parameters:
@@ -43,8 +43,8 @@ Metadata:
         default: 'CA Country Code (C)'
       CACertValidityDays:
         default: 'Root CA Certificate Validity (days)'
-      ApiSecret:
-        default: 'Shared API Secret'
+      ApiKeyValue:
+        default: 'API Gateway API Key Value'
       LogRetentionDays:
         default: 'CloudWatch Log Retention (days)'
       HandlerSourceUrl:
@@ -99,11 +99,14 @@ Parameters:
     AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 3653]
     Description: 'How many days to keep CloudWatch Logs for both Lambda functions (issuer + fetcher). Without this, Lambda logs are kept forever by default and cost grows unbounded. Default 30 days.'
 
-  ApiSecret:
+  ApiKeyValue:
     Type: String
     NoEcho: true
     MinLength: 20
-    Description: 'A secret string YOU choose (treat it like a password — generate one with e.g. `openssl rand -hex 20`). Devs use this to request/revoke certificates over the public FunctionUrl WITHOUT needing any AWS IAM credentials — they send it in an "x-api-key" header. Anyone who has this secret can request a certificate, so share it only with people you are onboarding, and rotate it (update this stack with a new value) if it ever leaks. Minimum 20 characters, no default — you must set this explicitly.'
+    MaxLength: 128
+    AllowedPattern: '^[A-Za-z0-9._-]{20,128}$'
+    ConstraintDescription: 'API Gateway API keys must be 20-128 chars: letters, digits, and . _ - only (no spaces).'
+    Description: 'The API Gateway API-key value YOU choose (treat it like a password — generate one with e.g. `openssl rand -hex 20`). A dev sends it in the "x-api-key" header to request/revoke certificates over the public API endpoint, with NO AWS IAM credentials. Anyone who has this key can request a certificate, so share it only with people you are onboarding, and rotate it (update this stack with a new value) if it ever leaks. 20-128 chars, no default — you must set this explicitly.'
 
   HandlerSourceUrl:
     Type: String
@@ -328,35 +331,89 @@ Resources:
           CA_CN: !Ref CACommonName
           CA_ORG: !Ref CAOrg
           CA_COUNTRY: !Ref CACountry
-          API_SECRET: !Ref ApiSecret
 
-  # ── Public HTTPS endpoint for sign/revoke — no AWS credentials needed ───────
-  # Auth is a shared secret (ApiSecret, checked as the "x-api-key" header
-  # inside handler.py's _url_handler), not IAM — this is what lets a dev with
-  # zero AWS access request/revoke a certificate. AuthType NONE means AWS
-  # itself doesn't gate the HTTP call; the Lambda code does, via the secret.
-  CALambdaUrl:
-    Type: AWS::Lambda::Url
+  # ── Public HTTPS endpoint: API Gateway REST API, API-key auth ───────────────
+  # A dev with NO AWS credentials calls POST <ApiEndpoint> with header
+  # "x-api-key: <ApiKeyValue>". API Gateway validates the key itself and only
+  # then proxies to the Lambda — so there's no secret-check in the Lambda code,
+  # and the Lambda can't be invoked directly by the public (only API Gateway,
+  # per CApiLambdaPermission, and the admin via IAM). Chosen over a Lambda
+  # Function URL because org guardrails often block public Function URLs but
+  # allow public API Gateway REST APIs.
+  CApi:
+    Type: AWS::ApiGateway::RestApi
     Properties:
-      TargetFunctionArn: !GetAtt CALambda.Arn
-      AuthType: NONE
-      Cors:
-        AllowOrigins: ['*']
-        AllowMethods: ['POST']
-        AllowHeaders: ['content-type', 'x-api-key']
+      Name: !Sub '${ProjectName}-api'
+      Description: 'Central CA public endpoint (sign/revoke, API-key gated)'
+      EndpointConfiguration:
+        Types: [REGIONAL]
 
-  CALambdaUrlPublicInvoke:
+  CApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CApi
+      ParentId: !GetAtt CApi.RootResourceId
+      PathPart: issue
+
+  CApiMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CApi
+      ResourceId: !Ref CApiResource
+      HttpMethod: POST
+      AuthorizationType: NONE      # no IAM/Cognito; the API key below is the gate
+      ApiKeyRequired: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST   # Lambda proxy integrations are always POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CALambda.Arn}/invocations'
+
+  CApiLambdaPermission:
     Type: AWS::Lambda::Permission
-    # Explicit ordering: this grant is meaningless before the Function URL
-    # itself exists, and nothing in Properties references CALambdaUrl (only
-    # CALambda by name), so CloudFormation has no automatic dependency here
-    # unless we say so — without it, the two can be created out of order.
-    DependsOn: CALambdaUrl
     Properties:
       FunctionName: !Ref CALambda
-      Action: lambda:InvokeFunctionUrl
-      Principal: '*'
-      FunctionUrlAuthType: NONE
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${CApi}/*/POST/issue'
+
+  # NOTE: AWS::ApiGateway::Deployment does not auto-redeploy when the API's
+  # methods change on a stack UPDATE. If you later change CApiMethod/CApiResource,
+  # rename this resource (e.g. CApiDeployment2) to force a fresh deployment.
+  CApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: CApiMethod
+    Properties:
+      RestApiId: !Ref CApi
+
+  CApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref CApi
+      DeploymentId: !Ref CApiDeployment
+      StageName: prod
+
+  CApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Name: !Sub '${ProjectName}-api-key'
+      Enabled: true
+      Value: !Ref ApiKeyValue   # you choose the value, so you already know it
+
+  CApiUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: CApiStage
+    Properties:
+      UsagePlanName: !Sub '${ProjectName}-usage-plan'
+      ApiStages:
+        - ApiId: !Ref CApi
+          Stage: prod
+
+  CApiUsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref CApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref CApiUsagePlan
 
   # ── Auto-bootstrap: creates the self-signed Root CA cert on stack deploy ────
   # No manual "run a test event" step. Idempotent on stack updates (reuses the
@@ -394,9 +451,9 @@ Outputs:
     Description: 'Issuer Lambda name — for admin direct invoke (sign/revoke/crl/bootstrap)'
     Value: !Ref CALambda
 
-  FunctionUrl:
-    Description: 'Public HTTPS endpoint for sign/revoke — give this + the ApiSecret you set to devs (no AWS credentials needed on their end). POST JSON with header x-api-key: <ApiSecret>'
-    Value: !GetAtt CALambdaUrl.FunctionUrl
+  ApiEndpoint:
+    Description: 'Public HTTPS endpoint for sign/revoke — give this + the ApiKeyValue you set to devs (no AWS credentials needed on their end). POST JSON with header x-api-key: <ApiKeyValue>'
+    Value: !Sub 'https://${CApi}.execute-api.${AWS::Region}.amazonaws.com/prod/issue'
 
   CACertificatePem:
     Description: 'Root CA certificate PEM (already registered as the Trust Anchor below — no manual copy-paste needed)'

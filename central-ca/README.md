@@ -86,7 +86,8 @@ central-ca-stack.yml                    (you deploy this — the only file, the 
   ├─ CAKey / CAKeyAlias (KMS)            the CA private key — never exportable
   ├─ CertTable (DynamoDB)                index of every issued certificate
   ├─ CALambda                            the issuer, built from the in-memory zip
-  ├─ CALambdaUrl + permission            public HTTPS endpoint (shared-secret auth)
+  ├─ CApi + Method/Deployment/Stage      API Gateway REST API (POST /issue)
+  ├─ CApiKey + UsagePlan                 API-key auth for the public endpoint
   ├─ CABootstrap                         auto-creates the Root CA cert on deploy
   └─ TrustAnchor                         X509CertificateData: !GetAtt CABootstrap.CACertificate
 
@@ -116,14 +117,16 @@ git push -u origin main
 2. **Stack name:** `central-ca`.
 3. **Parameters:** leave at defaults, or override `ProjectName`, `CACommonName`,
    `CACertValidityDays` (how long the Root CA cert itself lasts — default 3650
-   = 10 years, the max this stack allows), and set `ApiSecret` (required, no
-   default — generate one with `openssl rand -hex 20`).
+   = 10 years, the max this stack allows), and set `ApiKeyValue` (required, no
+   default — the API Gateway API key devs will use; generate one with
+   `openssl rand -hex 20`).
 4. ✅ acknowledge IAM resource creation → **Submit**.
 5. Wait for **CREATE_COMPLETE** (~1–2 min, one flat stack, no nesting).
    Everything happens automatically: fetch the code, create the CA infra,
-   bootstrap the Root CA cert, and register it as the Roles Anywhere Trust
-   Anchor. (No Role/Profile yet — that's the next, deliberately manual, step.)
-6. Open the **Outputs** tab → `CACertificatePem`, `TrustAnchorArn`, `FunctionUrl`.
+   bootstrap the Root CA cert, register it as the Roles Anywhere Trust
+   Anchor, and stand up the API Gateway endpoint. (No Role/Profile yet —
+   that's the next, deliberately manual, step.)
+6. Open the **Outputs** tab → `CACertificatePem`, `TrustAnchorArn`, `ApiEndpoint`.
 
 Verify the CA cert before trusting client certs it signs (paste `CACertificatePem` into a file first):
 ```bash
@@ -158,26 +161,35 @@ the result to the user. The user never touches AWS.
    (from the `central-ca` stack's Outputs) and the **Profile ARN / Role ARN**
    you created for her in "Giving a different user a different policy" below.
 
-### B. Public endpoint (HTTPS + shared secret, NO AWS credentials needed)
+### B. Public endpoint (API Gateway + API key, NO AWS credentials needed)
 
 For a developer who has **zero AWS access** — no IAM user, no console login —
-give them the `FunctionUrl` output and the `ApiSecret` you set at deploy time.
+give them the `ApiEndpoint` output and the `ApiKeyValue` you set at deploy time.
 They call it directly with `curl`:
 ```bash
-curl -X POST "<FunctionUrl>" \
+curl -X POST "<ApiEndpoint>" \
   -H "Content-Type: application/json" \
-  -H "x-api-key: <ApiSecret>" \
+  -H "x-api-key: <ApiKeyValue>" \
   -d '{"action":"sign","common_name":"alice","public_key":"<their public key>","days":30}'
 ```
-The response body has the same shape either way: `{"serial": "...", "certificate": "..."}`.
+The response body has the same shape as the admin path: `{"serial": "...", "certificate": "..."}`.
 
-**Only `sign` and `revoke` are reachable this way** — `bootstrap` and `crl`
-always return 403 over the public endpoint, even with a correct secret, since
-those are admin-only operations a dev has no reason to trigger. Auth is a
-single shared secret checked inside the Lambda (`hmac.compare_digest` against
-the `x-api-key` header) — everyone you give the secret to can request/revoke
-certificates, so **rotate it** (update the stack with a new `ApiSecret` value)
-if it ever leaks, and only share it with people you're actively onboarding.
+**Auth is handled by API Gateway, not the Lambda** — the `/issue` method
+requires an API key, so API Gateway rejects any request without a valid
+`x-api-key` *before* the Lambda runs. **Only `sign` and `revoke` are reachable
+this way** — `bootstrap`, `renew`, and `crl` still return 403 from inside the
+Lambda even with a valid key, since those are admin-only. Anyone with the key
+can request/revoke certificates, so **rotate it** (update the stack with a new
+`ApiKeyValue`) if it ever leaks, and only share it with people you're actively
+onboarding.
+
+> **Why API Gateway and not a Lambda Function URL?** A Function URL with
+> `AuthType: NONE` is the more obvious choice, but many AWS Organizations block
+> public Function URLs with a Service Control Policy (you'll see a persistent
+> `{"Message":"Forbidden"}` no matter how correct the resource policy is).
+> Public API Gateway REST APIs are far more commonly allowed. If your org
+> *also* blocks public API Gateway, fall back to admin-run issuance (path A) —
+> that path never needs a public endpoint at all.
 
 (`request-cert.sh` automates both paths — see "Automating onboarding" below.)
 
@@ -259,10 +271,10 @@ signing, and (if you pass the Trust Anchor/Profile/Role ARNs) downloading
   --days 365
 
 # Dev mode (the developer runs this themselves — NO AWS credentials needed,
-# just the FunctionUrl + ApiSecret you gave them):
+# just the ApiEndpoint + ApiKeyValue you gave them):
 ./request-cert.sh \
-  --url <FunctionUrl> \
-  --secret <ApiSecret> \
+  --url <ApiEndpoint> \
+  --secret <ApiKeyValue> \
   --name alice \
   --trust-anchor-arn <TrustAnchorArn> \
   --profile-arn <ProfileArn> \
@@ -294,12 +306,12 @@ automatically so exactly one certificate is ever valid per identity:
   --days 365
 ```
 
-Renewal is **admin-only** — it is never reachable over the public Function
-URL, even with a correct `ApiSecret`. Knowing a serial number isn't proof you
-hold the corresponding private key, so self-service renewal isn't safe without
-a stronger check than this endpoint does; the admin verifying the person's
-identity out-of-band before renewing is the actual security boundary here,
-same as initial onboarding.
+Renewal is **admin-only** — it is never reachable over the public API endpoint,
+even with a valid API key. Knowing a serial number isn't proof you hold the
+corresponding private key, so self-service renewal isn't safe without a stronger
+check than this endpoint does; the admin verifying the person's identity
+out-of-band before renewing is the actual security boundary here, same as
+initial onboarding.
 
 ## Revoke a user
 
@@ -316,7 +328,7 @@ Then point a `AWS::RolesAnywhere::CRL` resource at the regenerated
 
 Or over the public endpoint (dev self-revoking their own cert, if you want to
 allow that): `POST` the same JSON body with the `x-api-key` header to
-`FunctionUrl` — `revoke` is one of the two actions available there.
+`ApiEndpoint` — `revoke` is one of the two actions available there.
 
 ## Per-user permissions (2000 users, one role)
 
@@ -350,34 +362,28 @@ Note: the CSR/public-key subject is set from the authenticated request, not
 trusted from client input, so a caller cannot mint a cert for an identity they
 weren't authorized for. Restrict who may run `sign`/`revoke` via the IAM policy
 on `lambda:InvokeFunction` for the issuer function (admin path) — that is your
-issuance access control there. For the public Function URL path, the `ApiSecret`
-is the access control instead.
+issuance access control there. For the public path, the API Gateway **API key**
+(`ApiKeyValue`) is the access control instead.
 
-The `_url_handler` dispatch (secret validation, action allowlisting) has been
-unit-tested locally: correct secret + `sign`/`revoke` succeed; wrong or missing
-secret returns 403; `bootstrap`/`crl`/`renew` are rejected with 403 even with a
-correct secret; the existing admin direct-invoke and CloudFormation
-custom-resource paths are unaffected.
+The `_http_handler` dispatch (action allowlisting) has been unit-tested locally
+against a real API Gateway REST-proxy event shape: `sign`/`revoke` return
+proxy-format `{statusCode, headers, body}` responses; `bootstrap`/`renew`/`crl`
+are rejected with 403 even though API Gateway would have accepted the key;
+malformed JSON returns 400; the existing admin direct-invoke path still returns
+raw dicts, and the CloudFormation custom-resource path is unaffected.
 
-**Known deploy gotcha, found via live testing:** on at least one real deploy,
-AWS reported `AuthType: NONE` correctly set on the Function URL, but the
-`lambda:InvokeFunctionUrl` resource-based policy statement was missing anyway
-(Lambda console showed: *"Your function URL auth type is NONE, but is missing
-permissions required for public access"*) — a plain "no updates to be
-performed" stack update did not fix it, since CloudFormation only diffs
-against its own last-known state, not live drift. `CALambdaUrlPublicInvoke`
-now has an explicit `DependsOn: CALambdaUrl` to guard against this being an
-ordering issue on future deploys. If you still hit this: Lambda console →
-Configuration → Permissions → Add permissions → Policy statement type
-**"Function URL"** → Save. **Do not** also grant plain `lambda:InvokeFunction`
-to `Principal: *`, even though AWS's own banner suggests it — that action is
-exactly what the *admin* direct-invoke path relies on for access control (no
-secret check there), so granting it publicly would let anyone with any AWS
-account bypass `ApiSecret` entirely and reach `bootstrap`/`sign`/`renew` via
-a plain `aws lambda invoke`.
+**Deploy-endpoint note, learned the hard way:** an earlier version used a Lambda
+Function URL with `AuthType: NONE` + a resource policy granting public
+`InvokeFunctionUrl`. On the target account it returned a persistent
+`{"Message":"Forbidden"}` regardless of the (verifiably correct) resource
+policy — almost certainly an AWS Organizations SCP / Control Tower guardrail
+blocking public Lambda Function URLs. Switching to an **API Gateway REST API
+with an API key** sidesteps that class of guardrail (public REST APIs are far
+more commonly permitted). If your org blocks *that* too, use admin-run
+issuance (onboarding path A / `--lambda` mode), which needs no public endpoint.
 
 The `renew` action has also been unit-tested locally (fake DynamoDB): renewing
 an active serial issues a new cert for the same `common_name`, links it via
 `renewed_from`, and revokes the old serial with `revoked_reason: "renewed"`;
 renewing an already-revoked serial is rejected with a clear error; renewal is
-confirmed blocked over the public Function URL even with a correct secret.
+confirmed blocked over the public API endpoint even with a valid API key.

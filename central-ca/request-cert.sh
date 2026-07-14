@@ -10,16 +10,17 @@
 #                               secret needed (lambda:InvokeFunction on this
 #                               function IS the access control).
 #
-#   --url <FunctionUrl>
-#   --secret <ApiSecret>        Dev mode: plain HTTPS via curl, NO AWS
+#   --url <ApiEndpoint>
+#   --secret <ApiKeyValue>      Dev mode: plain HTTPS via curl, NO AWS
 #                               credentials needed at all — just the public
-#                               FunctionUrl + the shared ApiSecret the admin
-#                               set on the central-ca-stack.yml deploy. This
-#                               is what you give to a developer who has no
-#                               AWS account/login.
+#                               API Gateway endpoint (ApiEndpoint output) +
+#                               the API key (ApiKeyValue) the admin set on the
+#                               central-ca-stack.yml deploy. Sent as the
+#                               "x-api-key" header. This is what you give to a
+#                               developer who has no AWS account/login.
 #
 #   --renew <old-serial>        Optional, ADMIN-ONLY (--lambda mode only —
-#                               renewal is not available over the public URL).
+#                               renewal is not available over the public API).
 #                               Issues a fresh certificate + fresh keypair for
 #                               the SAME identity as an existing serial, then
 #                               revokes the old one. Use this instead of
@@ -33,7 +34,7 @@
 # Usage:
 #   ./request-cert.sh --lambda <IssuerLambdaName> --name <client-name> \
 #       --trust-anchor-arn <arn> --profile-arn <arn> --role-arn <arn> [--days 365]
-#   ./request-cert.sh --url <FunctionUrl> --secret <ApiSecret> --name <client-name> \
+#   ./request-cert.sh --url <ApiEndpoint> --secret <ApiKeyValue> --name <client-name> \
 #       --trust-anchor-arn <arn> --profile-arn <arn> --role-arn <arn> [--days 365]
 #   ./request-cert.sh --lambda <IssuerLambdaName> --name <client-name> \
 #       --renew <old-serial> --trust-anchor-arn <arn> --profile-arn <arn> --role-arn <arn>
@@ -77,7 +78,7 @@ elif [[ -n "$URL" && -n "$SECRET" ]]; then
   MODE="url"
   [[ -z "$RENEW_SERIAL" ]] || error "Renewal is admin-only — use --lambda mode, not --url"
 else
-  error "Required: either --lambda <name>  OR  --url <FunctionUrl> --secret <ApiSecret>"
+  error "Required: either --lambda <name>  OR  --url <ApiEndpoint> --secret <ApiKeyValue>"
 fi
 command -v openssl &>/dev/null || error "openssl not installed"
 command -v jq      &>/dev/null || error "jq not installed"
