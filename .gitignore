@@ -1,0 +1,16 @@
+# ── NEVER commit private key material ──────────────────────────────────────
+# The local OpenSSL CA private key (POC path) and every client private key.
+ca/
+client-*/
+*-private-key.pem
+*.key
+
+# Build artifacts for the central (KMS) CA Lambda
+central-ca/packaged.yml
+central-ca/*.zip
+central-ca/ca-certificate.pem
+central-ca/lambda/**/__pycache__/
+*.pyc
+
+# Local CA bookkeeping
+*.srl

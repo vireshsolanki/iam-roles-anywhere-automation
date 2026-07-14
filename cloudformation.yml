@@ -1,0 +1,105 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS IAM Roles Anywhere - Free tier using self-managed OpenSSL CA (no ACM PCA)'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'MyRolesAnywhere'
+    Description: 'Name prefix for all created resources'
+
+  CACertificateBody:
+    Type: String
+    Description: 'PEM-encoded Root CA certificate (generated locally by setup-ca.sh)'
+
+  SessionDurationSeconds:
+    Type: Number
+    Default: 3600
+    MinValue: 900
+    MaxValue: 43200
+    Description: 'Maximum session duration in seconds (15 min to 12 hours)'
+
+  IAMPolicyArns:
+    Type: CommaDelimitedList
+    Default: 'arn:aws:iam::aws:policy/ReadOnlyAccess'
+    Description: 'Comma-separated list of IAM policy ARNs to attach to the role'
+
+Resources:
+  # IAM Role for external systems
+  ExternalSystemRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-ExternalSystemRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: rolesanywhere.amazonaws.com
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
+              - sts:SetSourceIdentity
+      ManagedPolicyArns: !Ref IAMPolicyArns
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-ExternalSystemRole'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Trust Anchor using our own OpenSSL CA certificate (FREE - no ACM PCA)
+  TrustAnchor:
+    Type: AWS::RolesAnywhere::TrustAnchor
+    Properties:
+      Name: !Sub '${ProjectName}-TrustAnchor'
+      Enabled: true
+      Source:
+        SourceType: CERTIFICATE_BUNDLE
+        SourceData:
+          X509CertificateData: !Ref CACertificateBody
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-TrustAnchor'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Profile - binds the role to Roles Anywhere sessions
+  Profile:
+    Type: AWS::RolesAnywhere::Profile
+    Properties:
+      Name: !Sub '${ProjectName}-Profile'
+      Enabled: true
+      DurationSeconds: !Ref SessionDurationSeconds
+      RoleArns:
+        - !GetAtt ExternalSystemRole.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-Profile'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+Outputs:
+  TrustAnchorArn:
+    Description: 'Trust Anchor ARN'
+    Value: !GetAtt TrustAnchor.TrustAnchorArn
+    Export:
+      Name: !Sub '${AWS::StackName}-TrustAnchor-ARN'
+
+  ProfileArn:
+    Description: 'Profile ARN'
+    Value: !GetAtt Profile.ProfileArn
+    Export:
+      Name: !Sub '${AWS::StackName}-Profile-ARN'
+
+  RoleArn:
+    Description: 'IAM Role ARN'
+    Value: !GetAtt ExternalSystemRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-Role-ARN'
+
+  SetupClientCommand:
+    Description: 'Run this command to set up a client certificate after deploying'
+    Value: !Sub |
+      ./setup-client.sh \
+        --trust-anchor-arn ${TrustAnchor.TrustAnchorArn} \
+        --profile-arn ${Profile.ProfileArn} \
+        --role-arn ${ExternalSystemRole.Arn}

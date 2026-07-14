@@ -1,0 +1,179 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Central CA infrastructure (KMS, DynamoDB, Lambda, auto-bootstrap). Nested child of code-stack.yml — not normally deployed standalone.'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'CentralCA'
+    Description: 'Name prefix for all created resources'
+
+  BucketPrefix:
+    Type: String
+    Default: 'centralca-artifacts'
+    AllowedPattern: '^[a-z0-9][a-z0-9.-]{1,40}$'
+    Description: 'Lowercase prefix for the artifact S3 bucket (S3 names must be lowercase)'
+
+  CodeBucketName:
+    Type: String
+    Description: 'S3 bucket already holding the Lambda deployment zip (passed in by code-stack.yml)'
+
+  CodeObjectKey:
+    Type: String
+    Description: 'S3 key of the Lambda deployment zip (passed in by code-stack.yml)'
+
+  CACommonName:
+    Type: String
+    Default: 'Central-RootCA'
+    Description: 'Root CA subject Common Name'
+
+  CAOrg:
+    Type: String
+    Default: 'MyOrg'
+
+  CACountry:
+    Type: String
+    Default: 'US'
+
+Resources:
+  # ── The CA private key: lives in KMS, cannot be exported ────────────────────
+  CAKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub '${ProjectName} Root CA signing key (asymmetric, sign/verify)'
+      KeySpec: RSA_2048
+      KeyUsage: SIGN_VERIFY
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AdminRoot
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+
+  CAKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-ca'
+      TargetKeyId: !Ref CAKey
+
+  # ── Index of every issued certificate (needed for revocation / CRL) ─────────
+  CertTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-certificates'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: serial
+          AttributeType: S
+      KeySchema:
+        - AttributeName: serial
+          KeyType: HASH
+
+  # ── Public artifacts: CA certificate + CRL ──────────────────────────────────
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${BucketPrefix}-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ── Lambda: the issuing authority (invoked directly, IAM-authorized) ────────
+  CALambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ca-permissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: SignWithCAKey
+                Effect: Allow
+                Action:
+                  - kms:Sign
+                  - kms:GetPublicKey
+                Resource: !GetAtt CAKey.Arn
+              - Sid: CertIndex
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Scan
+                Resource: !GetAtt CertTable.Arn
+              - Sid: Artifacts
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub '${ArtifactBucket.Arn}/*'
+
+  CALambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-issuer'
+      Runtime: python3.12
+      Handler: handler.handler
+      Timeout: 30
+      MemorySize: 256
+      Role: !GetAtt CALambdaRole.Arn
+      # Pure standard-library Python (handler.py + kms_ca.py, ~16KB — too big to
+      # inline). code-stack.yml already fetched it to CodeBucketName/CodeObjectKey
+      # before this nested stack was created.
+      Code:
+        S3Bucket: !Ref CodeBucketName
+        S3Key: !Ref CodeObjectKey
+      Environment:
+        Variables:
+          CA_KEY_ID: !Ref CAKey
+          TABLE_NAME: !Ref CertTable
+          BUCKET_NAME: !Ref ArtifactBucket
+          CA_CN: !Ref CACommonName
+          CA_ORG: !Ref CAOrg
+          CA_COUNTRY: !Ref CACountry
+
+  # ── Auto-bootstrap: creates the self-signed Root CA cert on stack deploy ────
+  # No manual "run a test event" step — the CA certificate is created and
+  # returned as a stack Output the moment this stack finishes deploying.
+  # Idempotent on stack updates (reuses the existing CA if already created);
+  # never deletes CA material on stack deletion.
+  CABootstrap:
+    Type: Custom::CABootstrap
+    Properties:
+      ServiceToken: !GetAtt CALambda.Arn
+      Days: 3650
+
+Outputs:
+  LambdaName:
+    Description: 'Issuer Lambda name — invoke to sign/revoke user certificates'
+    Value: !Ref CALambda
+
+  CACertificatePem:
+    Description: 'Root CA certificate PEM — paste this into ../cloudformation.yml CACertificateBody'
+    Value: !GetAtt CABootstrap.CACertificate
+
+  CAKeyId:
+    Description: 'KMS CA key id'
+    Value: !Ref CAKey
+
+  ArtifactBucketName:
+    Description: 'S3 bucket holding ca-certificate.pem and crl.pem'
+    Value: !Ref ArtifactBucket
+
+  CertTableName:
+    Description: 'DynamoDB certificate index'
+    Value: !Ref CertTable
