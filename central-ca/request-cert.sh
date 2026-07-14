@@ -1,29 +1,43 @@
 #!/bin/bash
-# Onboard a user. Run on the USER's own machine.
+# Onboard a user — full pipeline in one command. Run on the USER's own machine.
 #
 # The user's PRIVATE KEY is generated locally and never leaves this machine —
 # only the PUBLIC key is sent to the CA. Issuance goes through `aws lambda
 # invoke`, which uses your normal AWS credentials (SSO / role) from the default
 # credential chain: NO long-lived access keys are read or promoted anywhere.
 #
-# Requires: openssl, jq, aws CLI with permission to invoke the issuer Lambda.
+# Requires: openssl, jq, curl, aws CLI with permission to invoke the issuer Lambda.
 #
 # Usage:
-#   ./request-cert.sh --lambda <IssuerLambdaName> --name <client-name> [--days 365]
+#   ./request-cert.sh --lambda <IssuerLambdaName> --name <client-name> \
+#       --trust-anchor-arn <arn> --profile-arn <arn> --role-arn <arn> \
+#       [--days 365] [--helper-version 1.4.0]
+#
+# If --trust-anchor-arn/--profile-arn/--role-arn are omitted, only the
+# certificate is issued (no aws_signing_helper setup) — useful if this user
+# gets their own Role/Profile with a different policy (see README.md,
+# "Giving a different user a different policy") and you want to wire up
+# get-credentials.sh yourself with their specific ARNs.
 
 set -euo pipefail
 
-LAMBDA=""; NAME=""; DAYS=365
+LAMBDA=""; NAME=""; DAYS=365; HELPER_VERSION="1.4.0"
+TRUST_ANCHOR_ARN=""; PROFILE_ARN=""; ROLE_ARN=""
 
-GREEN='\033[0;32m'; RED='\033[0;31m'; NC='\033[0m'
+GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
 info() { echo -e "${GREEN}[INFO]${NC} $1"; }
+warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --lambda) LAMBDA="$2"; shift 2 ;;
-    --name)   NAME="$2";   shift 2 ;;
-    --days)   DAYS="$2";   shift 2 ;;
+    --lambda)           LAMBDA="$2";           shift 2 ;;
+    --name)             NAME="$2";             shift 2 ;;
+    --days)             DAYS="$2";             shift 2 ;;
+    --trust-anchor-arn) TRUST_ANCHOR_ARN="$2";  shift 2 ;;
+    --profile-arn)       PROFILE_ARN="$2";      shift 2 ;;
+    --role-arn)          ROLE_ARN="$2";         shift 2 ;;
+    --helper-version)    HELPER_VERSION="$2";   shift 2 ;;
     *) error "Unknown option: $1" ;;
   esac
 done
@@ -64,5 +78,63 @@ info "Certificate issued."
 echo "  Serial      : $SERIAL"
 echo "  Private key : $KEY   (never left this machine)"
 echo "  Certificate : $CERT"
+
+if [[ -z "$TRUST_ANCHOR_ARN" || -z "$PROFILE_ARN" || -z "$ROLE_ARN" ]]; then
+  warn "No --trust-anchor-arn/--profile-arn/--role-arn given — skipping aws_signing_helper setup."
+  echo "  Re-run with those three flags to auto-generate get-credentials.sh / test-credentials.sh."
+  exit 0
+fi
+
+info "Downloading aws_signing_helper..."
+PLATFORM=$(uname -s)
+ARCH=$(uname -m)
+case "$PLATFORM" in
+  Linux)
+    [[ "$ARCH" == "x86_64" ]] || error "Unsupported Linux arch: $ARCH"
+    HELPER_URL="https://rolesanywhere.amazonaws.com/releases/${HELPER_VERSION}/X86_64/Linux/aws_signing_helper"
+    ;;
+  Darwin)
+    if   [[ "$ARCH" == "x86_64" ]]; then HELPER_URL="https://rolesanywhere.amazonaws.com/releases/${HELPER_VERSION}/X86_64/Darwin/aws_signing_helper"
+    elif [[ "$ARCH" == "arm64"  ]]; then HELPER_URL="https://rolesanywhere.amazonaws.com/releases/${HELPER_VERSION}/ARM64/Darwin/aws_signing_helper"
+    else error "Unsupported macOS arch: $ARCH"; fi
+    ;;
+  *) error "Unsupported platform: $PLATFORM" ;;
+esac
+curl -fsSL -o "$OUT/aws_signing_helper" "$HELPER_URL"
+chmod +x "$OUT/aws_signing_helper"
+
+info "Creating helper scripts..."
+cat > "$OUT/get-credentials.sh" << EOF
+#!/bin/bash
+# Retrieves temporary AWS credentials via IAM Roles Anywhere
+SCRIPT_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
+"\$SCRIPT_DIR/aws_signing_helper" credential-process \\
+    --certificate "\$SCRIPT_DIR/${NAME}-certificate.pem" \\
+    --private-key "\$SCRIPT_DIR/${NAME}-private-key.pem" \\
+    --trust-anchor-arn "$TRUST_ANCHOR_ARN" \\
+    --profile-arn "$PROFILE_ARN" \\
+    --role-arn "$ROLE_ARN"
+EOF
+chmod +x "$OUT/get-credentials.sh"
+
+cat > "$OUT/test-credentials.sh" << 'EOF'
+#!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+echo "Fetching temporary credentials..."
+CREDS=$("$SCRIPT_DIR/get-credentials.sh")
+if [[ $? -ne 0 ]]; then echo "Failed to get credentials"; exit 1; fi
+
+export AWS_ACCESS_KEY_ID=$(echo "$CREDS"     | jq -r '.AccessKeyId')
+export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r '.SecretAccessKey')
+export AWS_SESSION_TOKEN=$(echo "$CREDS"     | jq -r '.SessionToken')
+
+echo "Caller identity:"
+aws sts get-caller-identity
 echo ""
-echo "  Use with aws_signing_helper (see ../setup-client.sh for the wrapper scripts)."
+echo "S3 buckets:"
+aws s3 ls
+EOF
+chmod +x "$OUT/test-credentials.sh"
+
+info "Full pipeline complete — everything is ready in $OUT/"
+echo "  Run: cd $OUT && ./test-credentials.sh"

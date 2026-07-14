@@ -144,7 +144,85 @@ the **public** key. You sign it via the Lambda console:
    `TrustAnchorArn` / `ProfileArn` / `RoleArn` from the `central-ca` stack's Outputs.
 
 (`request-cert.sh` in this directory automates both sides via `aws lambda
-invoke` if you'd rather script it than click through the console.)
+invoke` if you'd rather script it than click through the console — see
+"Automating onboarding" below.)
+
+## Giving a different user a different policy (GUI, manual — by design)
+
+`central-ca-stack.yml` creates exactly **one** IAM Role (`ExternalSystemRole`)
+with **one** policy (`IAMPolicyArns`, default `ReadOnlyAccess`). This CA setup
+is for **testing**, and every real user or team tends to need a genuinely
+different, specific policy (not a generic "tier" a template can guess at) — so
+this is deliberately a manual console step, not a second CloudFormation
+template pretending to cover every case. Same CA, same Trust Anchor, new Role
++ Profile:
+
+1. **IAM console** → **Roles** → **Create role**.
+2. **Trusted entity type:** Custom trust policy. Paste:
+   ```json
+   {
+     "Version": "2012-10-17",
+     "Statement": [{
+       "Effect": "Allow",
+       "Principal": { "Service": "rolesanywhere.amazonaws.com" },
+       "Action": ["sts:AssumeRole", "sts:TagSession", "sts:SetSourceIdentity"],
+       "Condition": {
+         "ArnEquals": { "aws:SourceArn": "<TrustAnchorArn from central-ca-stack Outputs>" }
+       }
+     }]
+   }
+   ```
+   Optional but recommended — restrict this role to only the intended
+   certificate(s) by adding a CN check to the same `Condition` block:
+   ```json
+         "StringEquals": { "aws:PrincipalTag/x509Subject/CN": "alice" }
+   ```
+   (Use a list `["alice", "bob"]` for a group that shares this role.) Without
+   this, *any* certificate signed by your CA can assume this role — fine for
+   solo testing, not fine once you have users you don't fully trust with each
+   other's access.
+3. **Permissions:** attach whatever policy this user actually needs — a
+   managed policy (`AmazonS3FullAccess`, etc.) or a hand-written inline policy
+   scoped to exactly their resources. This is the step a generic template
+   can't do for you.
+4. **Role name:** something identifying, e.g. `Alice-AccessRole` → **Create role**.
+5. **IAM Roles Anywhere console** → **Profiles** → **Create profile**.
+   - **Name:** e.g. `Alice-Profile`
+   - **Roles:** select the role you just created
+   - **Session duration:** as needed (900–43200 seconds)
+   - **Create profile**
+6. Copy the new **Role ARN** and **Profile ARN**. Give the user:
+   - the same `TrustAnchorArn` as everyone else (one CA, shared)
+   - their own **Profile ARN** and **Role ARN** from steps 4–5
+
+Each user's `aws_signing_helper` call just points at their specific
+Profile/Role ARN instead of the default one — the certificate itself doesn't
+encode permissions, the Role does.
+
+## Automating onboarding
+
+`request-cert.sh` runs the entire user-side pipeline in one command — keygen,
+signing, and (if you pass the Trust Anchor/Profile/Role ARNs) downloading
+`aws_signing_helper` and generating ready-to-run `get-credentials.sh` /
+`test-credentials.sh` wrapper scripts, same as the local-CA path's
+`setup-client.sh`:
+
+```bash
+./request-cert.sh \
+  --lambda CentralCA-issuer \
+  --name alice \
+  --trust-anchor-arn <TrustAnchorArn> \
+  --profile-arn <ProfileArn> \
+  --role-arn <RoleArn> \
+  --days 365
+```
+
+Produces `client-alice/` with the private key, certificate, signing helper
+binary, and both wrapper scripts. Run `cd client-alice && ./test-credentials.sh`
+and you're done — that's Steps 4–7 (keygen → sign → verify → live credentials)
+in one call. Omit the three ARN flags to only issue the certificate (useful
+when you're using the "different policy per user" flow above and want to plug
+in that user's specific Profile/Role ARN yourself).
 
 ## Revoke a user
 
