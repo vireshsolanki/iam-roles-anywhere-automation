@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'AWS IAM Roles Anywhere - Free tier using self-managed OpenSSL CA (no ACM PCA)'
+Description: 'AWS IAM Roles Anywhere — Trust Anchor/Profile/Role for the LAPTOP-LOCAL OpenSSL CA path (CA private key managed by ./setup-ca.sh, not AWS KMS). For the KMS-backed central CA instead, see central-ca/central-ca-stack.yml.'
 
 Parameters:
   ProjectName:

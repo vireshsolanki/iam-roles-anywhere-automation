@@ -65,7 +65,7 @@ CA_CERT_BODY=$(cat ./ca/ca-certificate.pem)
 # ── Step 2: Deploy CloudFormation ────────────────────────────────────────────
 step "Step 2/3 — Deploying CloudFormation stack: $STACK_NAME"
 aws cloudformation deploy \
-    --template-file cloudformation.yml \
+    --template-file local-ca-stack.yml \
     --stack-name "$STACK_NAME" \
     --parameter-overrides \
         ProjectName="$PROJECT_NAME" \

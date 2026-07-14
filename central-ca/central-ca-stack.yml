@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'Central CA infrastructure (KMS, DynamoDB, Lambda, auto-bootstrap). Nested child of code-stack.yml — not normally deployed standalone.'
+Description: 'Central KMS-backed Certificate Authority for IAM Roles Anywhere — the ONLY template you deploy for this path. One flat stack: fetches handler.py + kms_ca.py from GitHub and zips them in-memory (no zip file in the repo, no manual S3 upload), creates the KMS CA key, the issuer Lambda, auto-bootstraps the Root CA cert, and registers it as a Roles Anywhere Trust Anchor/Profile/Role. See ../local-ca-stack.yml for the separate laptop-local OpenSSL CA path.'
 
 Parameters:
   ProjectName:
@@ -13,13 +13,20 @@ Parameters:
     AllowedPattern: '^[a-z0-9][a-z0-9.-]{1,40}$'
     Description: 'Lowercase prefix for the artifact S3 bucket (S3 names must be lowercase)'
 
-  CodeBucketName:
+  HandlerSourceUrl:
     Type: String
-    Description: 'S3 bucket already holding the Lambda deployment zip (passed in by code-stack.yml)'
+    Default: 'https://raw.githubusercontent.com/vireshsolanki/iam-roles-anywhere-automation/main/central-ca/lambda/handler.py'
+    Description: 'Raw GitHub URL to handler.py — fetched and zipped in-memory at deploy time, no zip file lives in the repo'
 
-  CodeObjectKey:
+  KmsCaSourceUrl:
     Type: String
-    Description: 'S3 key of the Lambda deployment zip (passed in by code-stack.yml)'
+    Default: 'https://raw.githubusercontent.com/vireshsolanki/iam-roles-anywhere-automation/main/central-ca/lambda/kms_ca.py'
+    Description: 'Raw GitHub URL to kms_ca.py'
+
+  CodeVersion:
+    Type: String
+    Default: 'v1'
+    Description: 'Bump this (v2, v3, ...) after pushing new code to GitHub, to force a re-fetch and update'
 
   CACommonName:
     Type: String
@@ -47,6 +54,93 @@ Parameters:
     Description: 'Comma-separated list of IAM policy ARNs to attach to the role that Roles Anywhere sessions assume'
 
 Resources:
+  # ── Staging bucket: also holds the fetched Lambda zip and (later) ca-certificate.pem / crl.pem ──
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${BucketPrefix}-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ── Fetcher: downloads handler.py + kms_ca.py from GitHub and zips them
+  # in-memory into S3. Tiny (<4096 chars), so it's inlined directly — this is
+  # why the real CA logic (~16KB combined) can't be inlined the same way.
+  FetcherRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-fetcher-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: put-code
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub '${ArtifactBucket.Arn}/*'
+
+  FetcherFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-fetcher'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt FetcherRole.Arn
+      Code:
+        ZipFile: |
+          import json, urllib.request, boto3, zipfile, io
+          s3 = boto3.client('s3')
+
+          def handler(event, context):
+              rt = event['RequestType']
+              props = event.get('ResourceProperties', {})
+              pid = event.get('PhysicalResourceId') or 'code-fetch'
+              try:
+                  if rt in ('Create', 'Update'):
+                      buf = io.BytesIO()
+                      with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+                          for name, url in props['Files'].items():
+                              zf.writestr(name, urllib.request.urlopen(url).read())
+                      s3.put_object(Bucket=props['Bucket'], Key=props['Key'], Body=buf.getvalue())
+                  _send(event, context, 'SUCCESS', pid)
+              except Exception as exc:
+                  _send(event, context, 'FAILED', pid, str(exc))
+
+          def _send(event, context, status, pid, reason=None):
+              body = json.dumps({
+                  'Status': status,
+                  'Reason': reason or f'See CloudWatch Log Stream: {context.log_stream_name}',
+                  'PhysicalResourceId': pid,
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'Data': {},
+              }).encode()
+              req = urllib.request.Request(event['ResponseURL'], data=body, method='PUT', headers={'Content-Type': ''})
+              urllib.request.urlopen(req)
+
+  FetchZip:
+    Type: Custom::FetchZip
+    Properties:
+      ServiceToken: !GetAtt FetcherFunction.Arn
+      Files:
+        handler.py: !Ref HandlerSourceUrl
+        kms_ca.py: !Ref KmsCaSourceUrl
+      Bucket: !Ref ArtifactBucket
+      Key: !Sub 'lambda-code-${CodeVersion}.zip'
+
   # ── The CA private key: lives in KMS, cannot be exported ────────────────────
   CAKey:
     Type: AWS::KMS::Key
@@ -82,17 +176,6 @@ Resources:
       KeySchema:
         - AttributeName: serial
           KeyType: HASH
-
-  # ── Public artifacts: CA certificate + CRL ──────────────────────────────────
-  ArtifactBucket:
-    Type: AWS::S3::Bucket
-    Properties:
-      BucketName: !Sub '${BucketPrefix}-${AWS::AccountId}-${AWS::Region}'
-      PublicAccessBlockConfiguration:
-        BlockPublicAcls: true
-        BlockPublicPolicy: true
-        IgnorePublicAcls: true
-        RestrictPublicBuckets: true
 
   # ── Lambda: the issuing authority (invoked directly, IAM-authorized) ────────
   CALambdaRole:
@@ -136,6 +219,7 @@ Resources:
 
   CALambda:
     Type: AWS::Lambda::Function
+    DependsOn: FetchZip
     Properties:
       FunctionName: !Sub '${ProjectName}-issuer'
       Runtime: python3.12
@@ -144,11 +228,10 @@ Resources:
       MemorySize: 256
       Role: !GetAtt CALambdaRole.Arn
       # Pure standard-library Python (handler.py + kms_ca.py, ~16KB — too big to
-      # inline). code-stack.yml already fetched it to CodeBucketName/CodeObjectKey
-      # before this nested stack was created.
+      # inline). FetchZip above already built it in ArtifactBucket.
       Code:
-        S3Bucket: !Ref CodeBucketName
-        S3Key: !Ref CodeObjectKey
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Sub 'lambda-code-${CodeVersion}.zip'
       Environment:
         Variables:
           CA_KEY_ID: !Ref CAKey
@@ -159,19 +242,17 @@ Resources:
           CA_COUNTRY: !Ref CACountry
 
   # ── Auto-bootstrap: creates the self-signed Root CA cert on stack deploy ────
-  # No manual "run a test event" step — the CA certificate is created and
-  # returned as a stack Output the moment this stack finishes deploying.
-  # Idempotent on stack updates (reuses the existing CA if already created);
-  # never deletes CA material on stack deletion.
+  # No manual "run a test event" step. Idempotent on stack updates (reuses the
+  # existing CA if already created); never deletes CA material on stack deletion.
   CABootstrap:
     Type: Custom::CABootstrap
     Properties:
       ServiceToken: !GetAtt CALambda.Arn
       Days: 3650
 
-  # ── Roles Anywhere trust chain, wired straight to the auto-bootstrapped cert
-  # No manual copy-paste of the CA cert into a second stack — this stack IS
-  # the complete pipeline: KMS CA → issuer Lambda → Trust Anchor → Profile → Role.
+  # ── Roles Anywhere trust chain, wired straight to the auto-bootstrapped cert ─
+  # No manual copy-paste of the CA cert anywhere — this stack IS the complete
+  # pipeline: KMS CA → issuer Lambda → Trust Anchor → Profile → Role.
   ExternalSystemRole:
     Type: AWS::IAM::Role
     Properties:
@@ -228,7 +309,7 @@ Outputs:
     Value: !Ref CALambda
 
   CACertificatePem:
-    Description: 'Root CA certificate PEM — paste this into ../cloudformation.yml CACertificateBody'
+    Description: 'Root CA certificate PEM (already registered as the Trust Anchor below — no manual copy-paste needed)'
     Value: !GetAtt CABootstrap.CACertificate
 
   CAKeyId:
@@ -244,7 +325,7 @@ Outputs:
     Value: !Ref CertTable
 
   TrustAnchorArn:
-    Description: 'Roles Anywhere Trust Anchor ARN'
+    Description: 'Roles Anywhere Trust Anchor ARN — use when issuing/using client certificates'
     Value: !GetAtt TrustAnchor.TrustAnchorArn
 
   ProfileArn:

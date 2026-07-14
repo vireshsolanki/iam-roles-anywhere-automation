@@ -46,7 +46,7 @@ Requires: `openssl`, `jq`, `curl`, AWS CLI configured.
 ```bash
 ./deploy.sh   # creates the CA, deploys CloudFormation, issues one client cert
 ```
-Or step by step — see [CLAUDE.md](CLAUDE.md) for `setup-ca.sh` / `cloudformation.yml`
+Or step by step — see [CLAUDE.md](CLAUDE.md) for `setup-ca.sh` / `local-ca-stack.yml`
 / `setup-client.sh` details. The CA private key (`./ca/ca-private-key.pem`)
 stays on this machine — back it up, since losing it means no new certs can be issued.
 
@@ -55,14 +55,14 @@ stays on this machine — back it up, since losing it means no new certs can be 
 The CA private key lives in **AWS KMS** (physically un-extractable) instead of
 a laptop, so onboarding is a Lambda call, not a local script, and losing an
 admin's laptop loses nothing. See **[central-ca/README.md](central-ca/README.md)**
-for full details — deploy is a single CloudFormation stack
-(`central-ca/code-stack.yml`) through the AWS Console, no CLI packaging, no
-manual S3 upload.
+for full details — deploy is a **single** CloudFormation stack
+(`central-ca/central-ca-stack.yml`) through the AWS Console, no CLI packaging,
+no manual S3 upload, no zip file in the repo.
 
 ```
-central-ca/code-stack.yml   ← deploy this one stack
-  └─ creates central-ca/infra-stack.yml automatically (nested)
-       → KMS CA key, DynamoDB cert index, issuer Lambda, auto-bootstrapped CA cert
+central-ca/central-ca-stack.yml   ← deploy this one stack, that's it
+  → KMS CA key, issuer Lambda, DynamoDB cert index, auto-bootstrapped CA cert,
+    Roles Anywhere Trust Anchor/Profile/Role — all in one flat template
 ```
 
 ---
@@ -70,8 +70,8 @@ central-ca/code-stack.yml   ← deploy this one stack
 ## Teardown
 
 ```bash
-aws cloudformation delete-stack --stack-name iam-roles-anywhere-poc   # Trust Anchor / Profile / Role
-aws cloudformation delete-stack --stack-name central-ca               # if using the central CA
+aws cloudformation delete-stack --stack-name iam-roles-anywhere-poc   # local CA path (local-ca-stack.yml)
+aws cloudformation delete-stack --stack-name central-ca               # central CA path (central-ca-stack.yml)
 ```
 `./ca/`, `./client-*/`, and KMS keys are not deleted automatically — KMS keys
 have a mandatory 7–30 day deletion waiting period once scheduled.

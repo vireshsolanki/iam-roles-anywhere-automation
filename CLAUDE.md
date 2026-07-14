@@ -34,7 +34,7 @@ Re-running is a no-op if the CA already exists. To regenerate, delete `./ca/`.
 **2. Deploy CloudFormation** (uses the CA cert as a CloudFormation parameter):
 ```bash
 aws cloudformation deploy \
-  --template-file cloudformation.yml \
+  --template-file local-ca-stack.yml \
   --stack-name iam-roles-anywhere-poc \
   --parameter-overrides \
     ProjectName=MyRolesAnywhere \
