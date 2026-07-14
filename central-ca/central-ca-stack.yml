@@ -159,21 +159,19 @@ Resources:
               - Effect: Allow
                 Action: s3:PutObject
                 Resource: !Sub '${ArtifactBucket.Arn}/*'
-
-  # Declared explicitly (with retention) so Lambda doesn't lazily create a
-  # default log group with no expiration on first invocation. Must exist
-  # before FetcherFunction is created — FetchZip below invokes it during this
-  # same stack deploy, so there's no window for the default group to win the
-  # race if this is created first (DependsOn on FetcherFunction, below).
-  FetcherFunctionLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub '/aws/lambda/${ProjectName}-fetcher'
-      RetentionInDays: !Ref LogRetentionDays
+              # Idempotent log-retention mode (below) creates-or-reuses the
+              # log group rather than requiring exclusive ownership — see
+              # CALambdaLogRetention / FetcherLogRetention custom resources.
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:PutRetentionPolicy
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-issuer:*'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-fetcher:*'
 
   FetcherFunction:
     Type: AWS::Lambda::Function
-    DependsOn: FetcherFunctionLogGroup
     Properties:
       FunctionName: !Sub '${ProjectName}-fetcher'
       Runtime: python3.12
@@ -184,6 +182,7 @@ Resources:
         ZipFile: |
           import json, urllib.request, boto3, zipfile, io
           s3 = boto3.client('s3')
+          logs = boto3.client('logs')
 
           def handler(event, context):
               rt = event['RequestType']
@@ -191,11 +190,19 @@ Resources:
               pid = event.get('PhysicalResourceId') or 'code-fetch'
               try:
                   if rt in ('Create', 'Update'):
-                      buf = io.BytesIO()
-                      with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
-                          for name, url in props['Files'].items():
-                              zf.writestr(name, urllib.request.urlopen(url).read())
-                      s3.put_object(Bucket=props['Bucket'], Key=props['Key'], Body=buf.getvalue())
+                      if props.get('Mode') == 'log-retention':
+                          log_name = props['LogGroupName']
+                          try:
+                              logs.create_log_group(logGroupName=log_name)
+                          except logs.exceptions.ResourceAlreadyExistsException:
+                              pass
+                          logs.put_retention_policy(logGroupName=log_name, retentionInDays=int(props['RetentionDays']))
+                      else:
+                          buf = io.BytesIO()
+                          with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+                              for name, url in props['Files'].items():
+                                  zf.writestr(name, urllib.request.urlopen(url).read())
+                          s3.put_object(Bucket=props['Bucket'], Key=props['Key'], Body=buf.getvalue())
                   _send(event, context, 'SUCCESS', pid)
               except Exception as exc:
                   _send(event, context, 'FAILED', pid, str(exc))
@@ -299,18 +306,9 @@ Resources:
                   - s3:PutObject
                 Resource: !Sub '${ArtifactBucket.Arn}/*'
 
-  # Same reasoning as FetcherFunctionLogGroup above: CABootstrap invokes
-  # CALambda during this same stack deploy, so the log group must exist
-  # before CALambda does.
-  CALambdaLogGroup:
-    Type: AWS::Logs::LogGroup
-    Properties:
-      LogGroupName: !Sub '/aws/lambda/${ProjectName}-issuer'
-      RetentionInDays: !Ref LogRetentionDays
-
   CALambda:
     Type: AWS::Lambda::Function
-    DependsOn: [FetchZip, CALambdaLogGroup]
+    DependsOn: FetchZip
     Properties:
       FunctionName: !Sub '${ProjectName}-issuer'
       Runtime: python3.12
@@ -331,6 +329,30 @@ Resources:
           CA_CN: !Ref CACommonName
           CA_ORG: !Ref CAOrg
           CA_COUNTRY: !Ref CACountry
+
+  # ── Log retention, applied idempotently (create-or-reuse + set retention) ───
+  # NOT AWS::Logs::LogGroup: that resource type fails hard with "already
+  # exists" if the log group was already lazily auto-created by a prior
+  # Lambda invocation (which happens during THIS SAME deploy, since
+  # CABootstrap/FetchZip invoke these functions) or by any earlier deploy of
+  # this stack. This mode of FetcherFunction instead creates the group only
+  # if missing, then unconditionally sets retention — safe to run repeatedly,
+  # self-heals a log group that already exists with no retention set.
+  FetcherLogRetention:
+    Type: Custom::LogRetention
+    Properties:
+      ServiceToken: !GetAtt FetcherFunction.Arn
+      Mode: log-retention
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-fetcher'
+      RetentionDays: !Ref LogRetentionDays
+
+  CALambdaLogRetention:
+    Type: Custom::LogRetention
+    Properties:
+      ServiceToken: !GetAtt FetcherFunction.Arn
+      Mode: log-retention
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-issuer'
+      RetentionDays: !Ref LogRetentionDays
 
   # ── Public HTTPS endpoint: API Gateway REST API, API-key auth ───────────────
   # A dev with NO AWS credentials calls POST <ApiEndpoint> with header
