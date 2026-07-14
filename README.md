@@ -18,6 +18,42 @@ Both paths produce the same AWS-facing infrastructure: a **Trust Anchor** (tells
 
 ---
 
+## How This Compares to Other Roles Anywhere Projects
+
+A few other public repos cover related ground. Worth being precise about what each one actually is, since they solve different (sometimes overlapping) problems:
+
+| | **This repo (Central CA)** | **This repo (Local CA)** | [aws/rolesanywhere-credential-helper](https://github.com/aws/rolesanywhere-credential-helper) | [aws-samples/sample-...-demo](https://github.com/aws-samples/sample-aws-iam-roles-anywhere-demo) | [aws-samples/sample-...-automation](https://github.com/aws-samples/sample-aws-iam-roles-anywhere-automation) |
+|---|---|---|---|---|---|
+| **What it is** | Full CA + issuance pipeline | Full CA + issuance pipeline | Client-side credential tool only | Educational demo | Full CA + issuance automation |
+| **CA type** | AWS KMS (never exportable) | Laptop OpenSSL | N/A — not a CA | Laptop OpenSSL (self-signed) | AWS ACM Private CA |
+| **Monthly cost** | ~$1.25–2.50 (see below) | ~$0 | N/A | ~$0 | **$400+** (ACM Private CA) |
+| **Says it's production-ready?** | Yes | For solo/small use | Yes (official AWS binary) | **No** — explicitly labeled "Not Production-Ready" | Claims yes |
+| **Cert renewal** | Automatic, old cert auto-revoked | Manual re-run | N/A | Not implemented | Not detailed in the repo |
+| **Revocation / CRL** | DynamoDB + CRL, enforced in seconds | Manual | N/A | Not implemented | Not detailed in the repo |
+| **Audit trail** | DynamoDB (full lifecycle: issued/renewed/revoked) | None built-in | N/A | CloudTrail only | Not detailed in the repo |
+| **Zero-AWS-credential onboarding** | Yes (API Gateway + API key) | No | N/A | No | No |
+
+**Important distinction:** `aws/rolesanywhere-credential-helper` isn't a competing CA solution — it's the **official `aws_signing_helper` binary**, and this project uses that exact same binary. Every `client-<name>/` directory this project generates downloads and wraps it. We're not reinventing the client side, only the CA and issuance pipeline around it.
+
+**The comparison that actually matters:** `sample-aws-iam-roles-anywhere-automation` is the closest thing to a real alternative — it's genuinely well-automated. But it deploys **ACM Private CA**, which is the $400/month cost this entire project exists to eliminate. If you're fine paying for ACM Private CA, that repo is a solid choice. If the cost is the blocker (which is why most people end up here), this project reaches the same Roles Anywhere end-state for a couple of dollars a month instead.
+
+---
+
+## Why Trust This Isn't Just Generated Boilerplate
+
+A fair question for any infra repo today. Two ways to check for yourself rather than take our word for it:
+
+**1. The cryptography is small enough to actually read.** [kms_ca.py](central-ca/lambda/kms_ca.py) is a ~240-line, dependency-free X.509/DER encoder — no `cryptography` package, no OpenSSL bindings, just `hashlib` + `base64` + hand-written ASN.1 TLV encoding. Read it in ten minutes and you've audited 100% of the certificate-generation logic. Nothing is hidden behind an imported library you have to trust blindly.
+
+**2. The commit history documents real bugs hit against live AWS, not hypothetical ones.** A few examples that only surface when you actually deploy something, not when you generate docs about deploying something:
+   - A Lambda Function URL configured with `AuthType: NONE` and a verifiably-correct public-invoke resource policy still returned a persistent `{"Message":"Forbidden"}` on a real account — traced to an AWS Organizations SCP blocking public Function URLs, not a config error. Fixed by switching to API Gateway + API key, which sidesteps that class of guardrail.
+   - AWS's own Lambda console suggested granting `lambda:InvokeFunction` publicly to fix a permissions warning. That suggestion was explicitly **not followed**, because it would have let anyone with any AWS account bypass the API key entirely and reach admin-only actions via a plain `aws lambda invoke` — a real security tradeoff caught and reasoned through, not glossed over.
+   - `AWS::Logs::LogGroup` failing with "already exists" because Lambda had already lazily auto-created the log group during the same deploy — fixed with an idempotent create-or-reuse custom resource instead of just telling users to manually delete the log group every time.
+
+None of these are the kind of thing you'd write from first principles without having actually broken it against a real AWS account first. The commit history (`git log`) has the full trail.
+
+---
+
 ## Architecture Overview
 
 ```
@@ -216,6 +252,44 @@ Developers **never touch AWS credentials**. Admin shares only the endpoint URL a
 | S3 | <$0.01/mo | CA cert + CRL, tiny objects |
 | **Total (Central CA)** | **~$1.50/mo** | vs. $400+/mo for ACM Private CA |
 | **Total (Local CA)** | **~$0** | Only EC2/RDS costs if deployed there |
+
+### Cost at Scale — 2000 Users (Central CA)
+
+The numbers above are for a light-traffic single-key setup. Here's a real,
+verified **AWS Pricing Calculator estimate** for a **2000-user production
+deployment**:
+
+**👉 [View the live calculator.aws estimate](https://calculator.aws/#/estimate?id=8bc0d34839e2c22287a2bc891ac321ee1cdeb114)**
+
+**Assumptions modeled:** 1 KMS asymmetric CMK (~1,500 sign/getPublicKey requests/mo,
+covering new onboardings + renewals + revocations), Lambda (~800 invocations/mo,
+256MB, 3s avg duration), DynamoDB on-demand (~800 read + 800 write request
+units/mo, 2000 items at ~1KB each), API Gateway REST (~800 requests/mo),
+CloudWatch Logs (0.5GB ingested/mo), S3 (CA cert + CRL, negligible size).
+
+| Component | Monthly cost |
+|---|---|
+| KMS (1 CMK + sign requests) | ~$1.03 |
+| Lambda | ~$0.00 (within free tier) |
+| DynamoDB (on-demand) | ~$0.01 |
+| API Gateway (REST) | ~$0.003 |
+| CloudWatch Logs | ~$0.21 |
+| S3 | <$0.01 |
+| **Total (2000 users)** | **~$1.25/mo** |
+
+**vs. ACM Private CA:** $400/month **flat fee**, regardless of user count, plus
+per-certificate issuance charges on top. At 2000 users that's **$400+/mo vs.
+~$1.25/mo** — a **>99.6% reduction**, or **~$4,785/year saved**.
+
+This scales sub-linearly: going from 2000 to 10,000 users mostly just adds
+DynamoDB/Lambda/API Gateway request volume (all still deep in free-tier or
+fractions-of-a-cent territory) — KMS's flat $1/mo key fee doesn't change at
+all, since it's one key regardless of how many certificates it signs.
+
+Build your own estimate the same way: [central-ca/central-ca-stack.yml](central-ca/central-ca-stack.yml)'s
+resource list maps 1:1 to calculator line items (1× KMS asymmetric CMK,
+Lambda, DynamoDB on-demand, API Gateway REST, CloudWatch Logs) — plug in your
+own volume assumptions at [calculator.aws](https://calculator.aws).
 
 ---
 
