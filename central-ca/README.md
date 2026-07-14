@@ -7,10 +7,12 @@ on demand by invoking a Lambda with your normal (SSO / role) credentials — so
 onboarding 2000+ users is just an authorized call, and losing a laptop loses
 nothing.
 
-**One flat CloudFormation stack gets you the entire pipeline** — KMS CA key →
-issuer Lambda → auto-bootstrapped Root CA cert → Roles Anywhere Trust Anchor →
-Profile → IAM Role. One file, one deploy, no nesting, no zip file in the repo,
-no manual copy-pasting the CA cert anywhere.
+**One flat CloudFormation stack gets you the core pipeline** — KMS CA key →
+issuer Lambda → auto-bootstrapped Root CA cert → Roles Anywhere Trust Anchor.
+One file, one deploy, no nesting, no zip file in the repo, no manual
+copy-pasting the CA cert anywhere. IAM Roles + Roles Anywhere Profiles are
+**deliberately not** part of this stack — see "Giving a different user a
+different policy" below for why, and how to create them.
 
 The scalable alternative to the laptop-local OpenSSL CA in the parent directory
 (`../local-ca-stack.yml`). Still no ACM Private CA, still ~$0 (KMS key ≈
@@ -50,22 +52,27 @@ $1/mo; Lambda + DynamoDB + S3 are pennies at this volume).
     ▼
   KMS asymmetric key  ← the CA private key (un-extractable)
     │
-    ├─►  DynamoDB   (index of every issued cert: serial, CN, status)
+    ├─►  DynamoDB   (index of EVERY cert ever issued: serial, CN, status,
+    │                issued_at, not_after, renewed_from — the single
+    │                source of truth for the whole CA)
     └─►  S3         (ca-certificate.pem, crl.pem)
                         │
                         ▼
           Roles Anywhere Trust Anchor  (trusts the CA cert — wired directly to
-          Roles Anywhere Profile        CABootstrap's output, no copy-paste)
+                                         CABootstrap's output, no copy-paste;
+                                         created ONCE, reused by every Role/
+                                         Profile you create manually)
           Roles Anywhere CRL           (rejects revoked certs)
 ```
 
-Four actions, one Lambda ([lambda/handler.py](lambda/handler.py)):
+Five actions, one Lambda ([lambda/handler.py](lambda/handler.py)):
 
 | Action | Who | Purpose |
 |---|---|---|
-| `bootstrap` | admin | Create the self-signed Root CA cert from the KMS key (once). |
-| `sign` | authorized issuers | Sign a user public key → client certificate. |
-| `revoke` | authorized issuers | Mark a serial revoked in DynamoDB. |
+| `bootstrap` | admin | Create the self-signed Root CA cert from the KMS key (once, on stack deploy). |
+| `sign` | admin, or a dev via the public endpoint | Sign a user public key → client certificate. |
+| `renew` | admin only | Issue a fresh cert for an existing identity, revoke the old one. |
+| `revoke` | admin, or a dev via the public endpoint | Mark a serial revoked in DynamoDB. |
 | `crl` | admin / schedule | Regenerate the CRL from revoked entries. |
 
 ## Stack layout
@@ -79,10 +86,12 @@ central-ca-stack.yml                    (you deploy this — the only file, the 
   ├─ CAKey / CAKeyAlias (KMS)            the CA private key — never exportable
   ├─ CertTable (DynamoDB)                index of every issued certificate
   ├─ CALambda                            the issuer, built from the in-memory zip
+  ├─ CALambdaUrl + permission            public HTTPS endpoint (shared-secret auth)
   ├─ CABootstrap                         auto-creates the Root CA cert on deploy
-  ├─ ExternalSystemRole (IAM)
-  ├─ TrustAnchor                         X509CertificateData: !GetAtt CABootstrap.CACertificate
-  └─ Profile
+  └─ TrustAnchor                         X509CertificateData: !GetAtt CABootstrap.CACertificate
+
+  (no IAM Role, no Roles Anywhere Profile here — created manually per user/tier,
+   see "Giving a different user a different policy" below)
 ```
 
 ## Deploy (AWS Console, one stack, no manual upload)
@@ -106,15 +115,15 @@ git push -u origin main
    upload `central-ca/central-ca-stack.yml` → **Next**.
 2. **Stack name:** `central-ca`.
 3. **Parameters:** leave at defaults, or override `ProjectName`, `CACommonName`,
-   `IAMPolicyArns` (the policy attached to the role Roles Anywhere sessions
-   assume — default `ReadOnlyAccess`), `SessionDurationSeconds`, etc.
+   `CACertValidityDays` (how long the Root CA cert itself lasts — default 3650
+   = 10 years, the max this stack allows), and set `ApiSecret` (required, no
+   default — generate one with `openssl rand -hex 20`).
 4. ✅ acknowledge IAM resource creation → **Submit**.
 5. Wait for **CREATE_COMPLETE** (~1–2 min, one flat stack, no nesting).
    Everything happens automatically: fetch the code, create the CA infra,
    bootstrap the Root CA cert, and register it as the Roles Anywhere Trust
-   Anchor with a Profile and IAM Role.
-6. Open the **Outputs** tab → you now have everything: `CACertificatePem`,
-   `TrustAnchorArn`, `ProfileArn`, `RoleArn`.
+   Anchor. (No Role/Profile yet — that's the next, deliberately manual, step.)
+6. Open the **Outputs** tab → `CACertificatePem`, `TrustAnchorArn`, `FunctionUrl`.
 
 Verify the CA cert before trusting client certs it signs (paste `CACertificatePem` into a file first):
 ```bash
@@ -145,8 +154,9 @@ the result to the user. The user never touches AWS.
    { "action": "sign", "common_name": "alice", "public_key": "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----\n", "days": 365 }
    ```
 2. **Test** → copy the `"certificate"` field from the response → that's
-   `alice-certificate.pem`. Send it back to Alice along with the
-   `TrustAnchorArn` / `ProfileArn` / `RoleArn` from the `central-ca` stack's Outputs.
+   `alice-certificate.pem`. Send it back to Alice along with `TrustAnchorArn`
+   (from the `central-ca` stack's Outputs) and the **Profile ARN / Role ARN**
+   you created for her in "Giving a different user a different policy" below.
 
 ### B. Public endpoint (HTTPS + shared secret, NO AWS credentials needed)
 
@@ -173,13 +183,16 @@ if it ever leaks, and only share it with people you're actively onboarding.
 
 ## Giving a different user a different policy (GUI, manual — by design)
 
-`central-ca-stack.yml` creates exactly **one** IAM Role (`ExternalSystemRole`)
-with **one** policy (`IAMPolicyArns`, default `ReadOnlyAccess`). This CA setup
-is for **testing**, and every real user or team tends to need a genuinely
-different, specific policy (not a generic "tier" a template can guess at) — so
-this is deliberately a manual console step, not a second CloudFormation
-template pretending to cover every case. Same CA, same Trust Anchor, new Role
-+ Profile:
+`central-ca-stack.yml` creates **no** IAM Role and **no** Roles Anywhere
+Profile — not even a default one. This CA setup is for **testing**, and every
+real user or team tends to need a genuinely different, specific policy (not a
+generic "tier" a template can guess at). A Role/Profile baked into
+CloudFormation is also exactly the kind of resource someone eventually hand-edits
+via console (adding a role, tweaking a duration) — the moment that happens,
+CloudFormation reports **drift** on that resource. Keeping Roles/Profiles out
+of the template entirely means there's nothing to drift. Every Role + Profile,
+including your very first one, is a manual console step, same CA, same Trust
+Anchor:
 
 1. **IAM console** → **Roles** → **Create role**.
 2. **Trusted entity type:** Custom trust policy. Paste:
@@ -213,15 +226,19 @@ template pretending to cover every case. Same CA, same Trust Anchor, new Role
 5. **IAM Roles Anywhere console** → **Profiles** → **Create profile**.
    - **Name:** e.g. `Alice-Profile`
    - **Roles:** select the role you just created
-   - **Session duration:** as needed (900–43200 seconds)
+   - **Session duration:** as needed, **per this dev/tier** (900–43200 seconds)
+     — this is the per-dev session control: each Profile has its own max
+     duration, so a contractor can get a short-lived Profile (e.g. 900s) while
+     a trusted internal service gets the full 43200s, independently of every
+     other Profile.
    - **Create profile**
 6. Copy the new **Role ARN** and **Profile ARN**. Give the user:
    - the same `TrustAnchorArn` as everyone else (one CA, shared)
    - their own **Profile ARN** and **Role ARN** from steps 4–5
 
 Each user's `aws_signing_helper` call just points at their specific
-Profile/Role ARN instead of the default one — the certificate itself doesn't
-encode permissions, the Role does.
+Profile/Role ARN instead of anyone else's — the certificate itself doesn't
+encode permissions or session length, the Role and Profile do.
 
 ## Automating onboarding
 
@@ -260,6 +277,30 @@ credentials in one call. Omit the three ARN flags to only issue the
 certificate (useful when you're using the "different policy per user" flow
 above and want to plug in that user's specific Profile/Role ARN yourself).
 
+## Renew a certificate (admin-only)
+
+Before or after a certificate expires, issue the same identity a fresh one —
+same `common_name`, new keypair, new serial, and the old serial gets revoked
+automatically so exactly one certificate is ever valid per identity:
+
+```bash
+./request-cert.sh \
+  --lambda CentralCA-issuer \
+  --name alice \
+  --renew <alice's old serial> \
+  --trust-anchor-arn <TrustAnchorArn> \
+  --profile-arn <ProfileArn> \
+  --role-arn <RoleArn> \
+  --days 365
+```
+
+Renewal is **admin-only** — it is never reachable over the public Function
+URL, even with a correct `ApiSecret`. Knowing a serial number isn't proof you
+hold the corresponding private key, so self-service renewal isn't safe without
+a stronger check than this endpoint does; the admin verifying the person's
+identity out-of-band before renewing is the actual security boundary here,
+same as initial onboarding.
+
 ## Revoke a user
 
 **Lambda console** → `CentralCA-issuer` → **Test** → new events:
@@ -272,6 +313,10 @@ then
 ```
 Then point a `AWS::RolesAnywhere::CRL` resource at the regenerated
 `s3://<artifact-bucket>/crl.pem` so AWS enforces the revocation.
+
+Or over the public endpoint (dev self-revoking their own cert, if you want to
+allow that): `POST` the same JSON body with the `x-api-key` header to
+`FunctionUrl` — `revoke` is one of the two actions available there.
 
 ## Per-user permissions (2000 users, one role)
 
@@ -310,7 +355,14 @@ is the access control instead.
 
 The `_url_handler` dispatch (secret validation, action allowlisting) has been
 unit-tested locally: correct secret + `sign`/`revoke` succeed; wrong or missing
-secret returns 403; `bootstrap`/`crl` are rejected with 403 even with a correct
-secret; the existing admin direct-invoke and CloudFormation custom-resource
-paths are unaffected. Not yet exercised against a live deployed `FunctionUrl` —
-do one real `curl` request after deploying to confirm end-to-end.
+secret returns 403; `bootstrap`/`crl`/`renew` are rejected with 403 even with a
+correct secret; the existing admin direct-invoke and CloudFormation
+custom-resource paths are unaffected. Not yet exercised against a live
+deployed `FunctionUrl` — do one real `curl` request after deploying to confirm
+end-to-end.
+
+The `renew` action has also been unit-tested locally (fake DynamoDB): renewing
+an active serial issues a new cert for the same `common_name`, links it via
+`renewed_from`, and revokes the old serial with `revoked_reason: "renewed"`;
+renewing an already-revoked serial is rejected with a clear error; renewal is
+confirmed blocked over the public Function URL even with a correct secret.

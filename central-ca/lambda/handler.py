@@ -6,6 +6,22 @@ caller's IAM permission to invoke this function IS the issuance access control,
 and `aws lambda invoke` uses the default credential chain (SSO / role), so no
 long-lived access keys are involved anywhere.
 
+Actions (payload {"action": ...}):
+  bootstrap : create the self-signed Root CA cert from the KMS key, store in S3.
+  sign      : sign a client public key -> client certificate; record in DynamoDB.
+  renew     : issue a fresh certificate for an EXISTING serial's common_name,
+              then revoke the old serial (exactly one valid cert per identity
+              at a time). Admin-only, not reachable over the public Function
+              URL — the old serial alone isn't proof of key possession, so
+              self-service renewal isn't safe without a stronger identity
+              check than this endpoint does today.
+  revoke    : mark an issued serial revoked in DynamoDB.
+  crl       : regenerate the CRL from revoked entries, store in S3.
+
+DynamoDB (CertTable) is the single source of truth for every certificate ever
+issued: serial, common_name, status (active/revoked), issued_at, not_after,
+and (for renewals) renewed_from linking to the serial it replaced.
+
 There are three ways this function is invoked, auto-detected from the event shape:
 
   1. CloudFormation custom resource (has "RequestType"/"ResponseURL") — the
@@ -26,8 +42,9 @@ There are three ways this function is invoked, auto-detected from the event shap
      admin's own tooling (request-cert.sh --lambda, the Lambda console Test
      tab). IAM-authenticated by the caller's own credentials; no secret
      needed since lambda:InvokeFunction permission on this function is
-     itself the access control. Supports all four actions, including
-     "bootstrap" and "crl" which are intentionally never exposed publicly.
+     itself the access control. Supports all five actions, including
+     "bootstrap", "renew", and "crl" which are intentionally never exposed
+     publicly.
 
 Environment: CA_KEY_ID, TABLE_NAME, BUCKET_NAME, CA_CN, CA_ORG, CA_COUNTRY,
 API_SECRET (only required for path 2).
@@ -71,6 +88,8 @@ def handler(event, context):
             return _bootstrap(int(event.get("days", 3650)))
         if action == "sign":
             return _sign(event)
+        if action == "renew":
+            return _renew(event)
         if action == "revoke":
             return _revoke(event["serial"])
         if action == "crl":
@@ -170,21 +189,53 @@ def _sign(event):
     days = int(event.get("days", 365))
     if not 1 <= days <= 3650:
         return {"error": "days must be between 1 and 3650"}
+    return _issue(common_name, public_key, days)
 
+
+def _renew(event):
+    old_serial = str(event["serial"])
+    public_key = event["public_key"]  # a fresh keypair, same as a new sign
+    days = int(event.get("days", 365))
+    if not 1 <= days <= 3650:
+        return {"error": "days must be between 1 and 3650"}
+
+    old_item = table.get_item(Key={"serial": old_serial}).get("Item")
+    if not old_item:
+        raise KeyError(old_serial)
+    if old_item.get("status") != "active":
+        return {"error": f"serial {old_serial} is not active (status={old_item.get('status')!r}); cannot renew"}
+
+    # CN comes from the CA's own record of the old cert, never from the
+    # renewal request — same non-negotiable rule as _sign: identity is
+    # never trusted from client-supplied input.
+    common_name = old_item["common_name"]
+    result = _issue(common_name, public_key, days, renewed_from=old_serial)
+
+    table.update_item(
+        Key={"serial": old_serial},
+        UpdateExpression="SET #s = :r, revoked_at = :t, revoked_reason = :reason",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={":r": "revoked", ":t": _now_iso(), ":reason": "renewed"},
+    )
+    return result
+
+
+def _issue(common_name, public_key, days, renewed_from=None):
     serial = kms_ca.new_serial()
     cert_pem = kms_ca.sign_certificate(
         CA_KEY_ID, public_key, CA_CN, common_name, CA_ORG, CA_COUNTRY, days, serial
     )
     not_after = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=days)
-    table.put_item(
-        Item={
-            "serial": str(serial),
-            "common_name": common_name,
-            "status": "active",
-            "issued_at": _now_iso(),
-            "not_after": not_after.isoformat(),
-        }
-    )
+    item = {
+        "serial": str(serial),
+        "common_name": common_name,
+        "status": "active",
+        "issued_at": _now_iso(),
+        "not_after": not_after.isoformat(),
+    }
+    if renewed_from:
+        item["renewed_from"] = renewed_from
+    table.put_item(Item=item)
     return {"serial": str(serial), "common_name": common_name, "certificate": cert_pem.decode()}
 
 

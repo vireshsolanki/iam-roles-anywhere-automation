@@ -18,6 +18,15 @@
 #                               is what you give to a developer who has no
 #                               AWS account/login.
 #
+#   --renew <old-serial>        Optional, ADMIN-ONLY (--lambda mode only —
+#                               renewal is not available over the public URL).
+#                               Issues a fresh certificate + fresh keypair for
+#                               the SAME identity as an existing serial, then
+#                               revokes the old one. Use this instead of
+#                               --name for renewals; the CA looks up the
+#                               common_name from its own record of the old
+#                               serial, not from anything you supply.
+#
 # Requires: openssl, jq, curl. `aws` CLI only needed for --lambda mode and for
 # test-credentials.sh (to exercise the resulting temporary credentials).
 #
@@ -26,6 +35,8 @@
 #       --trust-anchor-arn <arn> --profile-arn <arn> --role-arn <arn> [--days 365]
 #   ./request-cert.sh --url <FunctionUrl> --secret <ApiSecret> --name <client-name> \
 #       --trust-anchor-arn <arn> --profile-arn <arn> --role-arn <arn> [--days 365]
+#   ./request-cert.sh --lambda <IssuerLambdaName> --name <client-name> \
+#       --renew <old-serial> --trust-anchor-arn <arn> --profile-arn <arn> --role-arn <arn>
 #
 # If --trust-anchor-arn/--profile-arn/--role-arn are omitted, only the
 # certificate is issued (no aws_signing_helper setup) — useful if this user
@@ -35,7 +46,7 @@
 
 set -euo pipefail
 
-LAMBDA=""; URL=""; SECRET=""; NAME=""; DAYS=365; HELPER_VERSION="1.4.0"
+LAMBDA=""; URL=""; SECRET=""; NAME=""; DAYS=365; HELPER_VERSION="1.4.0"; RENEW_SERIAL=""
 TRUST_ANCHOR_ARN=""; PROFILE_ARN=""; ROLE_ARN=""
 
 GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
@@ -50,6 +61,7 @@ while [[ $# -gt 0 ]]; do
     --secret)            SECRET="$2";           shift 2 ;;
     --name)             NAME="$2";             shift 2 ;;
     --days)             DAYS="$2";             shift 2 ;;
+    --renew)             RENEW_SERIAL="$2";     shift 2 ;;
     --trust-anchor-arn) TRUST_ANCHOR_ARN="$2";  shift 2 ;;
     --profile-arn)       PROFILE_ARN="$2";      shift 2 ;;
     --role-arn)          ROLE_ARN="$2";         shift 2 ;;
@@ -63,6 +75,7 @@ if [[ -n "$LAMBDA" ]]; then
   command -v aws &>/dev/null || error "aws CLI not installed (required for --lambda mode)"
 elif [[ -n "$URL" && -n "$SECRET" ]]; then
   MODE="url"
+  [[ -z "$RENEW_SERIAL" ]] || error "Renewal is admin-only — use --lambda mode, not --url"
 else
   error "Required: either --lambda <name>  OR  --url <FunctionUrl> --secret <ApiSecret>"
 fi
@@ -81,8 +94,13 @@ openssl genrsa -out "$KEY" 2048 2>/dev/null
 chmod 600 "$KEY"
 openssl rsa -in "$KEY" -pubout -out "$PUB" 2>/dev/null
 
-PAYLOAD=$(jq -n --arg cn "$NAME" --arg pk "$(cat "$PUB")" --argjson days "$DAYS" \
-  '{action:"sign", common_name:$cn, public_key:$pk, days:$days}')
+if [[ -n "$RENEW_SERIAL" ]]; then
+  PAYLOAD=$(jq -n --arg serial "$RENEW_SERIAL" --arg pk "$(cat "$PUB")" --argjson days "$DAYS" \
+    '{action:"renew", serial:$serial, public_key:$pk, days:$days}')
+else
+  PAYLOAD=$(jq -n --arg cn "$NAME" --arg pk "$(cat "$PUB")" --argjson days "$DAYS" \
+    '{action:"sign", common_name:$cn, public_key:$pk, days:$days}')
+fi
 
 if [[ "$MODE" == "lambda" ]]; then
   info "Requesting certificate from central CA (via aws lambda invoke, admin credentials)..."

@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'Central KMS-backed Certificate Authority for IAM Roles Anywhere — the ONLY template you deploy for this path. One flat stack: fetches handler.py + kms_ca.py from GitHub and zips them in-memory (no zip file in the repo, no manual S3 upload), creates the KMS CA key, the issuer Lambda, auto-bootstraps the Root CA cert, and registers it as a Roles Anywhere Trust Anchor/Profile/Role. See ../local-ca-stack.yml for the separate laptop-local OpenSSL CA path.'
+Description: 'Central KMS-backed Certificate Authority for IAM Roles Anywhere — the ONLY template you deploy for this path. One flat stack: fetches handler.py + kms_ca.py from GitHub and zips them in-memory (no zip file in the repo, no manual S3 upload), creates the KMS CA key, the issuer Lambda, auto-bootstraps the Root CA cert, and registers it as a Roles Anywhere Trust Anchor. Every Role/Profile is created separately via the manual IAM console runbook in README.md (deliberately not in this template — avoids drift). See ../local-ca-stack.yml for the separate laptop-local OpenSSL CA path.'
 
 Metadata:
   AWS::CloudFormation::Interface:
@@ -15,11 +15,7 @@ Metadata:
           - CACommonName
           - CAOrg
           - CACountry
-      - Label:
-          default: 'Roles Anywhere Access'
-        Parameters:
-          - SessionDurationSeconds
-          - IAMPolicyArns
+          - CACertValidityDays
       - Label:
           default: 'Public Endpoint (lets devs request certs with NO AWS credentials)'
         Parameters:
@@ -41,10 +37,8 @@ Metadata:
         default: 'CA Organization (O)'
       CACountry:
         default: 'CA Country Code (C)'
-      SessionDurationSeconds:
-        default: 'Max Session Duration (seconds)'
-      IAMPolicyArns:
-        default: 'IAM Policy ARNs to Attach'
+      CACertValidityDays:
+        default: 'Root CA Certificate Validity (days)'
       ApiSecret:
         default: 'Shared API Secret'
       HandlerSourceUrl:
@@ -86,17 +80,12 @@ Parameters:
     ConstraintDescription: 'Must be exactly 2 uppercase letters (ISO 3166-1 alpha-2), e.g. US, IN, GB, DE.'
     Description: 'The Country (C) field of the Root CA certificate subject — a 2-letter ISO country code, e.g. "US", "IN", "GB". This is a strict X.509 convention: exactly 2 uppercase letters, nothing else.'
 
-  SessionDurationSeconds:
+  CACertValidityDays:
     Type: Number
-    Default: 43200
-    MinValue: 900
-    MaxValue: 43200
-    Description: 'Maximum Roles Anywhere session duration in seconds. Default 43200 = 12 hours (the maximum AWS allows). Other common values: 3600 = 1 hour, 900 = 15 minutes (the minimum). This bounds how long a single aws_signing_helper credential fetch can request before it must fetch again — lower it if you want callers to re-authenticate against the CA more often.'
-
-  IAMPolicyArns:
-    Type: CommaDelimitedList
-    Default: 'arn:aws:iam::aws:policy/ReadOnlyAccess'
-    Description: 'Comma-separated list of IAM managed-policy ARNs to attach to the role that Roles Anywhere sessions assume — this is what client certificates are actually allowed to do in AWS once they exchange their cert for credentials. Example for broader access: "arn:aws:iam::aws:policy/PowerUserAccess". You can list multiple, comma-separated.'
+    Default: 3650
+    MinValue: 1
+    MaxValue: 3650
+    Description: 'How many days the Root CA certificate itself is valid for. Default 3650 = 10 years (the maximum this stack allows, and a sane default for a CA that many client certificates will chain to over time). Only used the FIRST time this stack bootstraps the CA — changing it later has no effect on an already-created CA cert; you would need a new CA entirely to change this. Individual client certificates have their own, separately configurable validity (the "days" field on each sign/renew request), unrelated to this value.'
 
   ApiSecret:
     Type: String
@@ -338,32 +327,15 @@ Resources:
     Type: Custom::CABootstrap
     Properties:
       ServiceToken: !GetAtt CALambda.Arn
-      Days: 3650
+      Days: !Ref CACertValidityDays
 
-  # ── Roles Anywhere trust chain, wired straight to the auto-bootstrapped cert ─
-  # No manual copy-paste of the CA cert anywhere — this stack IS the complete
-  # pipeline: KMS CA → issuer Lambda → Trust Anchor → Profile → Role.
-  ExternalSystemRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub '${ProjectName}-ExternalSystemRole'
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: rolesanywhere.amazonaws.com
-            Action:
-              - sts:AssumeRole
-              - sts:TagSession
-              - sts:SetSourceIdentity
-      ManagedPolicyArns: !Ref IAMPolicyArns
-      Tags:
-        - Key: Name
-          Value: !Sub '${ProjectName}-ExternalSystemRole'
-        - Key: ManagedBy
-          Value: CloudFormation
-
+  # ── Trust Anchor, wired straight to the auto-bootstrapped cert ──────────────
+  # No manual copy-paste of the CA cert anywhere. Deliberately NO Role/Profile
+  # here — every Role/Profile (including your very first one) is created
+  # manually via the IAM/Roles Anywhere console (see README.md, "Giving a
+  # different user a different policy"). Keeping them out of CloudFormation
+  # means there's nothing here for a hand-edit (e.g. adding a role to a
+  # Profile via console) to drift against.
   TrustAnchor:
     Type: AWS::RolesAnywhere::TrustAnchor
     Properties:
@@ -376,20 +348,6 @@ Resources:
       Tags:
         - Key: Name
           Value: !Sub '${ProjectName}-TrustAnchor'
-        - Key: ManagedBy
-          Value: CloudFormation
-
-  Profile:
-    Type: AWS::RolesAnywhere::Profile
-    Properties:
-      Name: !Sub '${ProjectName}-Profile'
-      Enabled: true
-      DurationSeconds: !Ref SessionDurationSeconds
-      RoleArns:
-        - !GetAtt ExternalSystemRole.Arn
-      Tags:
-        - Key: Name
-          Value: !Sub '${ProjectName}-Profile'
         - Key: ManagedBy
           Value: CloudFormation
 
@@ -419,13 +377,5 @@ Outputs:
     Value: !Ref CertTable
 
   TrustAnchorArn:
-    Description: 'Roles Anywhere Trust Anchor ARN — use when issuing/using client certificates'
+    Description: 'Roles Anywhere Trust Anchor ARN — created ONCE per stack, reused by every Role/Profile you create manually (see README.md)'
     Value: !GetAtt TrustAnchor.TrustAnchorArn
-
-  ProfileArn:
-    Description: 'Roles Anywhere Profile ARN'
-    Value: !GetAtt Profile.ProfileArn
-
-  RoleArn:
-    Description: 'IAM Role ARN that Roles Anywhere sessions assume'
-    Value: !GetAtt ExternalSystemRole.Arn
