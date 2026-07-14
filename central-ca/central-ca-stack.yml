@@ -21,6 +21,10 @@ Metadata:
         Parameters:
           - ApiSecret
       - Label:
+          default: 'Operations'
+        Parameters:
+          - LogRetentionDays
+      - Label:
           default: 'Deployment Source (GitHub) — only change if you forked the repo or moved branches'
         Parameters:
           - HandlerSourceUrl
@@ -41,6 +45,8 @@ Metadata:
         default: 'Root CA Certificate Validity (days)'
       ApiSecret:
         default: 'Shared API Secret'
+      LogRetentionDays:
+        default: 'CloudWatch Log Retention (days)'
       HandlerSourceUrl:
         default: 'handler.py Source URL'
       KmsCaSourceUrl:
@@ -86,6 +92,12 @@ Parameters:
     MinValue: 1
     MaxValue: 3650
     Description: 'How many days the Root CA certificate itself is valid for. Default 3650 = 10 years (the maximum this stack allows, and a sane default for a CA that many client certificates will chain to over time). Only used the FIRST time this stack bootstraps the CA — changing it later has no effect on an already-created CA cert; you would need a new CA entirely to change this. Individual client certificates have their own, separately configurable validity (the "days" field on each sign/renew request), unrelated to this value.'
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 3653]
+    Description: 'How many days to keep CloudWatch Logs for both Lambda functions (issuer + fetcher). Without this, Lambda logs are kept forever by default and cost grows unbounded. Default 30 days.'
 
   ApiSecret:
     Type: String
@@ -145,8 +157,20 @@ Resources:
                 Action: s3:PutObject
                 Resource: !Sub '${ArtifactBucket.Arn}/*'
 
+  # Declared explicitly (with retention) so Lambda doesn't lazily create a
+  # default log group with no expiration on first invocation. Must exist
+  # before FetcherFunction is created — FetchZip below invokes it during this
+  # same stack deploy, so there's no window for the default group to win the
+  # race if this is created first (DependsOn on FetcherFunction, below).
+  FetcherFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-fetcher'
+      RetentionInDays: !Ref LogRetentionDays
+
   FetcherFunction:
     Type: AWS::Lambda::Function
+    DependsOn: FetcherFunctionLogGroup
     Properties:
       FunctionName: !Sub '${ProjectName}-fetcher'
       Runtime: python3.12
@@ -272,9 +296,18 @@ Resources:
                   - s3:PutObject
                 Resource: !Sub '${ArtifactBucket.Arn}/*'
 
+  # Same reasoning as FetcherFunctionLogGroup above: CABootstrap invokes
+  # CALambda during this same stack deploy, so the log group must exist
+  # before CALambda does.
+  CALambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-issuer'
+      RetentionInDays: !Ref LogRetentionDays
+
   CALambda:
     Type: AWS::Lambda::Function
-    DependsOn: FetchZip
+    DependsOn: [FetchZip, CALambdaLogGroup]
     Properties:
       FunctionName: !Sub '${ProjectName}-issuer'
       Runtime: python3.12
