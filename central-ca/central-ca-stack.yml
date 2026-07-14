@@ -1,45 +1,84 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: 'Central KMS-backed Certificate Authority for IAM Roles Anywhere — the ONLY template you deploy for this path. One flat stack: fetches handler.py + kms_ca.py from GitHub and zips them in-memory (no zip file in the repo, no manual S3 upload), creates the KMS CA key, the issuer Lambda, auto-bootstraps the Root CA cert, and registers it as a Roles Anywhere Trust Anchor/Profile/Role. See ../local-ca-stack.yml for the separate laptop-local OpenSSL CA path.'
 
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'AWS Resource Naming'
+        Parameters:
+          - ProjectName
+          - BucketPrefix
+      - Label:
+          default: 'Root CA Certificate Identity (X.509 subject fields)'
+        Parameters:
+          - CACommonName
+          - CAOrg
+          - CACountry
+      - Label:
+          default: 'Roles Anywhere Access'
+        Parameters:
+          - SessionDurationSeconds
+          - IAMPolicyArns
+      - Label:
+          default: 'Deployment Source (GitHub) — only change if you forked the repo or moved branches'
+        Parameters:
+          - HandlerSourceUrl
+          - KmsCaSourceUrl
+          - CodeVersion
+    ParameterLabels:
+      ProjectName:
+        default: 'Project Name'
+      BucketPrefix:
+        default: 'S3 Bucket Prefix'
+      CACommonName:
+        default: 'CA Common Name (CN)'
+      CAOrg:
+        default: 'CA Organization (O)'
+      CACountry:
+        default: 'CA Country Code (C)'
+      SessionDurationSeconds:
+        default: 'Max Session Duration (seconds)'
+      IAMPolicyArns:
+        default: 'IAM Policy ARNs to Attach'
+      HandlerSourceUrl:
+        default: 'handler.py Source URL'
+      KmsCaSourceUrl:
+        default: 'kms_ca.py Source URL'
+      CodeVersion:
+        default: 'Code Version Tag'
+
 Parameters:
   ProjectName:
     Type: String
     Default: 'CentralCA'
-    Description: 'Name prefix for all created resources'
+    AllowedPattern: '^[A-Za-z][A-Za-z0-9-]{1,30}$'
+    Description: 'Prefix used to name every resource this stack creates (KMS alias, Lambda functions, DynamoDB table, IAM roles, Trust Anchor, Profile). Letters, numbers, hyphens only, must start with a letter. Example: "CentralCA" produces "CentralCA-issuer", "CentralCA-TrustAnchor", etc.'
 
   BucketPrefix:
     Type: String
     Default: 'centralca-artifacts'
     AllowedPattern: '^[a-z0-9][a-z0-9.-]{1,40}$'
-    Description: 'Lowercase prefix for the artifact S3 bucket (S3 names must be lowercase)'
-
-  HandlerSourceUrl:
-    Type: String
-    Default: 'https://raw.githubusercontent.com/vireshsolanki/iam-roles-anywhere-automation/main/central-ca/lambda/handler.py'
-    Description: 'Raw GitHub URL to handler.py — fetched and zipped in-memory at deploy time, no zip file lives in the repo'
-
-  KmsCaSourceUrl:
-    Type: String
-    Default: 'https://raw.githubusercontent.com/vireshsolanki/iam-roles-anywhere-automation/main/central-ca/lambda/kms_ca.py'
-    Description: 'Raw GitHub URL to kms_ca.py'
-
-  CodeVersion:
-    Type: String
-    Default: 'v1'
-    Description: 'Bump this (v2, v3, ...) after pushing new code to GitHub, to force a re-fetch and update'
+    Description: 'Prefix for the S3 bucket that holds the fetched Lambda code, ca-certificate.pem, and crl.pem. Must be lowercase (S3 bucket-name rule). The full bucket name becomes "<this>-<AccountId>-<Region>", so it stays globally unique — you normally never need to change this default.'
 
   CACommonName:
     Type: String
     Default: 'Central-RootCA'
-    Description: 'Root CA subject Common Name'
+    MinLength: 1
+    Description: 'The Common Name (CN) of the Root CA certificate — the main identifying name AWS and openssl show for this CA, e.g. in "Issuer: CN=Central-RootCA". Pick something that identifies this CA within your organization, e.g. "Acme-RootCA" or "Cosmos-Central-RootCA". No spaces recommended.'
 
   CAOrg:
     Type: String
     Default: 'MyOrg'
+    MinLength: 1
+    Description: 'The Organization (O) field of the Root CA certificate subject — typically your company or team name, e.g. "Acme Inc" or "Playto". Shown alongside the Common Name in every certificate this CA issues (both the CA cert itself and every client cert signed by it).'
 
   CACountry:
     Type: String
     Default: 'US'
+    AllowedPattern: '^[A-Z]{2}$'
+    ConstraintDescription: 'Must be exactly 2 uppercase letters (ISO 3166-1 alpha-2), e.g. US, IN, GB, DE.'
+    Description: 'The Country (C) field of the Root CA certificate subject — a 2-letter ISO country code, e.g. "US", "IN", "GB". This is a strict X.509 convention: exactly 2 uppercase letters, nothing else.'
 
   SessionDurationSeconds:
     Type: Number
@@ -51,7 +90,22 @@ Parameters:
   IAMPolicyArns:
     Type: CommaDelimitedList
     Default: 'arn:aws:iam::aws:policy/ReadOnlyAccess'
-    Description: 'Comma-separated list of IAM policy ARNs to attach to the role that Roles Anywhere sessions assume'
+    Description: 'Comma-separated list of IAM managed-policy ARNs to attach to the role that Roles Anywhere sessions assume — this is what client certificates are actually allowed to do in AWS once they exchange their cert for credentials. Example for broader access: "arn:aws:iam::aws:policy/PowerUserAccess". You can list multiple, comma-separated.'
+
+  HandlerSourceUrl:
+    Type: String
+    Default: 'https://raw.githubusercontent.com/vireshsolanki/iam-roles-anywhere-automation/main/central-ca/lambda/handler.py'
+    Description: 'Raw GitHub URL to handler.py — fetched and zipped in-memory at deploy time, no zip file lives in the repo. Only change this if you forked the repo or use a different branch.'
+
+  KmsCaSourceUrl:
+    Type: String
+    Default: 'https://raw.githubusercontent.com/vireshsolanki/iam-roles-anywhere-automation/main/central-ca/lambda/kms_ca.py'
+    Description: 'Raw GitHub URL to kms_ca.py. Only change this if you forked the repo or use a different branch.'
+
+  CodeVersion:
+    Type: String
+    Default: 'v1'
+    Description: 'Version tag embedded in the S3 object key for the fetched Lambda code (lambda-code-<this>.zip). Bump this (v2, v3, ...) after pushing new code to GitHub and updating this stack, to force a re-fetch and Lambda update — CloudFormation only re-fetches when this value changes.'
 
 Resources:
   # ── Staging bucket: also holds the fetched Lambda zip and (later) ca-certificate.pem / crl.pem ──
