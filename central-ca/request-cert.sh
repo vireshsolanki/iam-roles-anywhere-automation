@@ -2,16 +2,30 @@
 # Onboard a user — full pipeline in one command. Run on the USER's own machine.
 #
 # The user's PRIVATE KEY is generated locally and never leaves this machine —
-# only the PUBLIC key is sent to the CA. Issuance goes through `aws lambda
-# invoke`, which uses your normal AWS credentials (SSO / role) from the default
-# credential chain: NO long-lived access keys are read or promoted anywhere.
+# only the PUBLIC key is sent to the CA. Two ways to reach the CA to get it
+# signed — pick ONE:
 #
-# Requires: openssl, jq, curl, aws CLI with permission to invoke the issuer Lambda.
+#   --lambda <name>            Admin mode: `aws lambda invoke`, authenticated
+#                               by the caller's own AWS IAM credentials. No
+#                               secret needed (lambda:InvokeFunction on this
+#                               function IS the access control).
+#
+#   --url <FunctionUrl>
+#   --secret <ApiSecret>        Dev mode: plain HTTPS via curl, NO AWS
+#                               credentials needed at all — just the public
+#                               FunctionUrl + the shared ApiSecret the admin
+#                               set on the central-ca-stack.yml deploy. This
+#                               is what you give to a developer who has no
+#                               AWS account/login.
+#
+# Requires: openssl, jq, curl. `aws` CLI only needed for --lambda mode and for
+# test-credentials.sh (to exercise the resulting temporary credentials).
 #
 # Usage:
 #   ./request-cert.sh --lambda <IssuerLambdaName> --name <client-name> \
-#       --trust-anchor-arn <arn> --profile-arn <arn> --role-arn <arn> \
-#       [--days 365] [--helper-version 1.4.0]
+#       --trust-anchor-arn <arn> --profile-arn <arn> --role-arn <arn> [--days 365]
+#   ./request-cert.sh --url <FunctionUrl> --secret <ApiSecret> --name <client-name> \
+#       --trust-anchor-arn <arn> --profile-arn <arn> --role-arn <arn> [--days 365]
 #
 # If --trust-anchor-arn/--profile-arn/--role-arn are omitted, only the
 # certificate is issued (no aws_signing_helper setup) — useful if this user
@@ -21,7 +35,7 @@
 
 set -euo pipefail
 
-LAMBDA=""; NAME=""; DAYS=365; HELPER_VERSION="1.4.0"
+LAMBDA=""; URL=""; SECRET=""; NAME=""; DAYS=365; HELPER_VERSION="1.4.0"
 TRUST_ANCHOR_ARN=""; PROFILE_ARN=""; ROLE_ARN=""
 
 GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
@@ -32,6 +46,8 @@ error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 while [[ $# -gt 0 ]]; do
   case $1 in
     --lambda)           LAMBDA="$2";           shift 2 ;;
+    --url)               URL="$2";              shift 2 ;;
+    --secret)            SECRET="$2";           shift 2 ;;
     --name)             NAME="$2";             shift 2 ;;
     --days)             DAYS="$2";             shift 2 ;;
     --trust-anchor-arn) TRUST_ANCHOR_ARN="$2";  shift 2 ;;
@@ -41,10 +57,18 @@ while [[ $# -gt 0 ]]; do
     *) error "Unknown option: $1" ;;
   esac
 done
-[[ -n "$LAMBDA" && -n "$NAME" ]] || error "Required: --lambda <name> --name <client-name>"
+[[ -n "$NAME" ]] || error "Required: --name <client-name>"
+if [[ -n "$LAMBDA" ]]; then
+  MODE="lambda"
+  command -v aws &>/dev/null || error "aws CLI not installed (required for --lambda mode)"
+elif [[ -n "$URL" && -n "$SECRET" ]]; then
+  MODE="url"
+else
+  error "Required: either --lambda <name>  OR  --url <FunctionUrl> --secret <ApiSecret>"
+fi
 command -v openssl &>/dev/null || error "openssl not installed"
 command -v jq      &>/dev/null || error "jq not installed"
-command -v aws     &>/dev/null || error "aws CLI not installed"
+command -v curl    &>/dev/null || error "curl not installed"
 
 OUT="./client-${NAME}"
 mkdir -p "$OUT"
@@ -60,12 +84,21 @@ openssl rsa -in "$KEY" -pubout -out "$PUB" 2>/dev/null
 PAYLOAD=$(jq -n --arg cn "$NAME" --arg pk "$(cat "$PUB")" --argjson days "$DAYS" \
   '{action:"sign", common_name:$cn, public_key:$pk, days:$days}')
 
-info "Requesting certificate from central CA (via aws lambda invoke)..."
-aws lambda invoke \
-  --function-name "$LAMBDA" \
-  --payload "$PAYLOAD" \
-  --cli-binary-format raw-in-base64-out \
-  "$OUT/response.json" >/dev/null
+if [[ "$MODE" == "lambda" ]]; then
+  info "Requesting certificate from central CA (via aws lambda invoke, admin credentials)..."
+  aws lambda invoke \
+    --function-name "$LAMBDA" \
+    --payload "$PAYLOAD" \
+    --cli-binary-format raw-in-base64-out \
+    "$OUT/response.json" >/dev/null
+else
+  info "Requesting certificate from central CA (via HTTPS, no AWS credentials)..."
+  curl -sS -X POST "$URL" \
+    -H "Content-Type: application/json" \
+    -H "x-api-key: $SECRET" \
+    -d "$PAYLOAD" \
+    -o "$OUT/response.json"
+fi
 
 if ! jq -e '.certificate' "$OUT/response.json" >/dev/null 2>&1; then
   error "Signing failed: $(cat "$OUT/response.json")"

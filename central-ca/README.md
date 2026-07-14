@@ -131,10 +131,15 @@ idempotent, so updates never regenerate or invalidate the existing CA cert.
 > `./setup-client.sh`) uses [`../local-ca-stack.yml`](../local-ca-stack.yml)
 > instead — it's an independent stack, not something you deploy here.
 
-## Onboard a user
+## Onboard a user — two ways, depending on whether the user has AWS credentials
 
-The user generates their own key pair locally and sends you (the admin) only
-the **public** key. You sign it via the Lambda console:
+Both ways sign the same certificate the same way; they only differ in *how the
+sign request reaches the CA*.
+
+### A. Admin-run (`aws lambda invoke`, IAM-authenticated)
+
+You (the admin) run this yourself, using your own AWS credentials, then hand
+the result to the user. The user never touches AWS.
 1. **Lambda console** → `CentralCA-issuer` → **Test** tab → new event:
    ```json
    { "action": "sign", "common_name": "alice", "public_key": "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----\n", "days": 365 }
@@ -143,9 +148,28 @@ the **public** key. You sign it via the Lambda console:
    `alice-certificate.pem`. Send it back to Alice along with the
    `TrustAnchorArn` / `ProfileArn` / `RoleArn` from the `central-ca` stack's Outputs.
 
-(`request-cert.sh` in this directory automates both sides via `aws lambda
-invoke` if you'd rather script it than click through the console — see
-"Automating onboarding" below.)
+### B. Public endpoint (HTTPS + shared secret, NO AWS credentials needed)
+
+For a developer who has **zero AWS access** — no IAM user, no console login —
+give them the `FunctionUrl` output and the `ApiSecret` you set at deploy time.
+They call it directly with `curl`:
+```bash
+curl -X POST "<FunctionUrl>" \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: <ApiSecret>" \
+  -d '{"action":"sign","common_name":"alice","public_key":"<their public key>","days":30}'
+```
+The response body has the same shape either way: `{"serial": "...", "certificate": "..."}`.
+
+**Only `sign` and `revoke` are reachable this way** — `bootstrap` and `crl`
+always return 403 over the public endpoint, even with a correct secret, since
+those are admin-only operations a dev has no reason to trigger. Auth is a
+single shared secret checked inside the Lambda (`hmac.compare_digest` against
+the `x-api-key` header) — everyone you give the secret to can request/revoke
+certificates, so **rotate it** (update the stack with a new `ApiSecret` value)
+if it ever leaks, and only share it with people you're actively onboarding.
+
+(`request-cert.sh` automates both paths — see "Automating onboarding" below.)
 
 ## Giving a different user a different policy (GUI, manual — by design)
 
@@ -205,9 +229,10 @@ encode permissions, the Role does.
 signing, and (if you pass the Trust Anchor/Profile/Role ARNs) downloading
 `aws_signing_helper` and generating ready-to-run `get-credentials.sh` /
 `test-credentials.sh` wrapper scripts, same as the local-CA path's
-`setup-client.sh`:
+`setup-client.sh`. Two modes, matching the two onboarding paths above — pick one:
 
 ```bash
+# Admin mode (you run this, using your own AWS credentials):
 ./request-cert.sh \
   --lambda CentralCA-issuer \
   --name alice \
@@ -215,14 +240,25 @@ signing, and (if you pass the Trust Anchor/Profile/Role ARNs) downloading
   --profile-arn <ProfileArn> \
   --role-arn <RoleArn> \
   --days 365
+
+# Dev mode (the developer runs this themselves — NO AWS credentials needed,
+# just the FunctionUrl + ApiSecret you gave them):
+./request-cert.sh \
+  --url <FunctionUrl> \
+  --secret <ApiSecret> \
+  --name alice \
+  --trust-anchor-arn <TrustAnchorArn> \
+  --profile-arn <ProfileArn> \
+  --role-arn <RoleArn> \
+  --days 365
 ```
 
-Produces `client-alice/` with the private key, certificate, signing helper
-binary, and both wrapper scripts. Run `cd client-alice && ./test-credentials.sh`
-and you're done — that's Steps 4–7 (keygen → sign → verify → live credentials)
-in one call. Omit the three ARN flags to only issue the certificate (useful
-when you're using the "different policy per user" flow above and want to plug
-in that user's specific Profile/Role ARN yourself).
+Either way, produces `client-alice/` with the private key, certificate,
+signing helper binary, and both wrapper scripts. Run `cd client-alice &&
+./test-credentials.sh` and you're done — that's keygen → sign → verify → live
+credentials in one call. Omit the three ARN flags to only issue the
+certificate (useful when you're using the "different policy per user" flow
+above and want to plug in that user's specific Profile/Role ARN yourself).
 
 ## Revoke a user
 
@@ -268,5 +304,13 @@ and confirming with OpenSSL) and against a **live deployment**:
 Note: the CSR/public-key subject is set from the authenticated request, not
 trusted from client input, so a caller cannot mint a cert for an identity they
 weren't authorized for. Restrict who may run `sign`/`revoke` via the IAM policy
-on `lambda:InvokeFunction` for the issuer function — that is your issuance
-access control.
+on `lambda:InvokeFunction` for the issuer function (admin path) — that is your
+issuance access control there. For the public Function URL path, the `ApiSecret`
+is the access control instead.
+
+The `_url_handler` dispatch (secret validation, action allowlisting) has been
+unit-tested locally: correct secret + `sign`/`revoke` succeed; wrong or missing
+secret returns 403; `bootstrap`/`crl` are rejected with 403 even with a correct
+secret; the existing admin direct-invoke and CloudFormation custom-resource
+paths are unaffected. Not yet exercised against a live deployed `FunctionUrl` —
+do one real `curl` request after deploying to confirm end-to-end.

@@ -6,23 +6,34 @@ caller's IAM permission to invoke this function IS the issuance access control,
 and `aws lambda invoke` uses the default credential chain (SSO / role), so no
 long-lived access keys are involved anywhere.
 
-Actions (payload {"action": ...}):
-  bootstrap : create the self-signed Root CA cert from the KMS key, store in S3.
-  sign      : sign a client public key -> client certificate; record in DynamoDB.
-  revoke    : mark an issued serial revoked in DynamoDB.
-  crl       : regenerate the CRL from revoked entries, store in S3.
+There are three ways this function is invoked, auto-detected from the event shape:
 
-This function also doubles as a CloudFormation custom-resource handler: the
-stack template invokes it directly (ServiceToken: the function's own ARN) so
-the Root CA certificate is created automatically on stack deploy, with no
-separate manual "bootstrap" invoke — see the CABootstrap resource in
-infrastructure.yml. CloudFormation events are recognized by the presence of
-"RequestType"/"ResponseURL" and are routed to _cfn_bootstrap instead of the
-action dispatch below.
+  1. CloudFormation custom resource (has "RequestType"/"ResponseURL") — the
+     stack template invokes it directly (ServiceToken: the function's own
+     ARN) so the Root CA certificate is created automatically on stack
+     deploy. Routed to _cfn_bootstrap. See the CABootstrap resource in
+     central-ca-stack.yml.
 
-Environment: CA_KEY_ID, TABLE_NAME, BUCKET_NAME, CA_CN, CA_ORG, CA_COUNTRY.
+  2. Lambda Function URL (has "requestContext"."http") — a public HTTPS
+     endpoint (see the FunctionUrl output) that lets a caller with NO AWS
+     credentials request/revoke a certificate, gated by a shared secret
+     (API_SECRET env var) checked against the "x-api-key" header. Only
+     "sign" and "revoke" are reachable this way — "bootstrap" and "crl" stay
+     admin-only via direct invoke, since a dev has no legitimate reason to
+     trigger either. Routed to _url_handler.
+
+  3. Direct `aws lambda invoke` with a raw {"action": ...} payload — the
+     admin's own tooling (request-cert.sh --lambda, the Lambda console Test
+     tab). IAM-authenticated by the caller's own credentials; no secret
+     needed since lambda:InvokeFunction permission on this function is
+     itself the access control. Supports all four actions, including
+     "bootstrap" and "crl" which are intentionally never exposed publicly.
+
+Environment: CA_KEY_ID, TABLE_NAME, BUCKET_NAME, CA_CN, CA_ORG, CA_COUNTRY,
+API_SECRET (only required for path 2).
 """
 import datetime
+import hmac
 import json
 import os
 import urllib.request
@@ -37,9 +48,11 @@ BUCKET_NAME = os.environ["BUCKET_NAME"]
 CA_CN = os.environ.get("CA_CN", "Central-RootCA")
 CA_ORG = os.environ.get("CA_ORG", "MyOrg")
 CA_COUNTRY = os.environ.get("CA_COUNTRY", "US")
+API_SECRET = os.environ.get("API_SECRET", "")
 
 CA_CERT_KEY = "ca-certificate.pem"
 CRL_KEY = "crl.pem"
+URL_ALLOWED_ACTIONS = {"sign", "revoke"}
 
 s3 = boto3.client("s3")
 table = boto3.resource("dynamodb").Table(TABLE_NAME)
@@ -48,6 +61,9 @@ table = boto3.resource("dynamodb").Table(TABLE_NAME)
 def handler(event, context):
     if isinstance(event, dict) and "RequestType" in event and "ResponseURL" in event:
         return _cfn_bootstrap(event, context)
+
+    if isinstance(event, dict) and "http" in event.get("requestContext", {}):
+        return _url_handler(event)
 
     action = (event or {}).get("action")
     try:
@@ -64,6 +80,42 @@ def handler(event, context):
         return {"error": f"missing field: {exc}"}
     except Exception as exc:  # CloudWatch has the traceback
         return {"error": str(exc)}
+
+
+# ── Lambda Function URL (public HTTPS, shared-secret auth) ──────────────────
+def _url_handler(event):
+    headers = {k.lower(): v for k, v in (event.get("headers") or {}).items()}
+    supplied = headers.get("x-api-key", "")
+    if not API_SECRET or not hmac.compare_digest(supplied, API_SECRET):
+        return _http_response(403, {"error": "invalid or missing x-api-key"})
+
+    try:
+        body = json.loads(event.get("body") or "{}")
+    except json.JSONDecodeError:
+        return _http_response(400, {"error": "body must be valid JSON"})
+
+    action = body.get("action")
+    if action not in URL_ALLOWED_ACTIONS:
+        return _http_response(403, {"error": f"action {action!r} is not available over the public endpoint"})
+
+    try:
+        if action == "sign":
+            result = _sign(body)
+        else:
+            result = _revoke(body["serial"])
+        return _http_response(200, result)
+    except KeyError as exc:
+        return _http_response(400, {"error": f"missing field: {exc}"})
+    except Exception as exc:  # CloudWatch has the traceback
+        return _http_response(500, {"error": str(exc)})
+
+
+def _http_response(status, payload):
+    return {
+        "statusCode": status,
+        "headers": {"Content-Type": "application/json"},
+        "body": json.dumps(payload),
+    }
 
 
 # ── CloudFormation custom resource (auto-bootstrap on stack deploy) ─────────

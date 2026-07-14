@@ -21,6 +21,10 @@ Metadata:
           - SessionDurationSeconds
           - IAMPolicyArns
       - Label:
+          default: 'Public Endpoint (lets devs request certs with NO AWS credentials)'
+        Parameters:
+          - ApiSecret
+      - Label:
           default: 'Deployment Source (GitHub) — only change if you forked the repo or moved branches'
         Parameters:
           - HandlerSourceUrl
@@ -41,6 +45,8 @@ Metadata:
         default: 'Max Session Duration (seconds)'
       IAMPolicyArns:
         default: 'IAM Policy ARNs to Attach'
+      ApiSecret:
+        default: 'Shared API Secret'
       HandlerSourceUrl:
         default: 'handler.py Source URL'
       KmsCaSourceUrl:
@@ -91,6 +97,12 @@ Parameters:
     Type: CommaDelimitedList
     Default: 'arn:aws:iam::aws:policy/ReadOnlyAccess'
     Description: 'Comma-separated list of IAM managed-policy ARNs to attach to the role that Roles Anywhere sessions assume — this is what client certificates are actually allowed to do in AWS once they exchange their cert for credentials. Example for broader access: "arn:aws:iam::aws:policy/PowerUserAccess". You can list multiple, comma-separated.'
+
+  ApiSecret:
+    Type: String
+    NoEcho: true
+    MinLength: 20
+    Description: 'A secret string YOU choose (treat it like a password — generate one with e.g. `openssl rand -hex 20`). Devs use this to request/revoke certificates over the public FunctionUrl WITHOUT needing any AWS IAM credentials — they send it in an "x-api-key" header. Anyone who has this secret can request a certificate, so share it only with people you are onboarding, and rotate it (update this stack with a new value) if it ever leaks. Minimum 20 characters, no default — you must set this explicitly.'
 
   HandlerSourceUrl:
     Type: String
@@ -294,6 +306,30 @@ Resources:
           CA_CN: !Ref CACommonName
           CA_ORG: !Ref CAOrg
           CA_COUNTRY: !Ref CACountry
+          API_SECRET: !Ref ApiSecret
+
+  # ── Public HTTPS endpoint for sign/revoke — no AWS credentials needed ───────
+  # Auth is a shared secret (ApiSecret, checked as the "x-api-key" header
+  # inside handler.py's _url_handler), not IAM — this is what lets a dev with
+  # zero AWS access request/revoke a certificate. AuthType NONE means AWS
+  # itself doesn't gate the HTTP call; the Lambda code does, via the secret.
+  CALambdaUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt CALambda.Arn
+      AuthType: NONE
+      Cors:
+        AllowOrigins: ['*']
+        AllowMethods: ['POST']
+        AllowHeaders: ['content-type', 'x-api-key']
+
+  CALambdaUrlPublicInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CALambda
+      Action: lambda:InvokeFunctionUrl
+      Principal: '*'
+      FunctionUrlAuthType: NONE
 
   # ── Auto-bootstrap: creates the self-signed Root CA cert on stack deploy ────
   # No manual "run a test event" step. Idempotent on stack updates (reuses the
@@ -359,8 +395,12 @@ Resources:
 
 Outputs:
   LambdaName:
-    Description: 'Issuer Lambda name — invoke to sign/revoke user certificates'
+    Description: 'Issuer Lambda name — for admin direct invoke (sign/revoke/crl/bootstrap)'
     Value: !Ref CALambda
+
+  FunctionUrl:
+    Description: 'Public HTTPS endpoint for sign/revoke — give this + the ApiSecret you set to devs (no AWS credentials needed on their end). POST JSON with header x-api-key: <ApiSecret>'
+    Value: !GetAtt CALambdaUrl.FunctionUrl
 
   CACertificatePem:
     Description: 'Root CA certificate PEM (already registered as the Trust Anchor below — no manual copy-paste needed)'
