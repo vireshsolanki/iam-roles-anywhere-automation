@@ -13,10 +13,10 @@ Parameters:
 
   SessionDurationSeconds:
     Type: Number
-    Default: 3600
+    Default: 43200
     MinValue: 900
     MaxValue: 43200
-    Description: 'Maximum session duration in seconds (15 min to 12 hours)'
+    Description: 'Maximum Roles Anywhere session duration in seconds. Default 43200 = 12 hours (the maximum AWS allows). Other common values: 3600 = 1 hour, 900 = 15 minutes (the minimum). This bounds how long a single aws_signing_helper credential fetch can request before it must fetch again — lower it if you want callers to re-authenticate against the CA more often.'
 
   IAMPolicyArns:
     Type: CommaDelimitedList
