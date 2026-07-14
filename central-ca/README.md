@@ -357,9 +357,24 @@ The `_url_handler` dispatch (secret validation, action allowlisting) has been
 unit-tested locally: correct secret + `sign`/`revoke` succeed; wrong or missing
 secret returns 403; `bootstrap`/`crl`/`renew` are rejected with 403 even with a
 correct secret; the existing admin direct-invoke and CloudFormation
-custom-resource paths are unaffected. Not yet exercised against a live
-deployed `FunctionUrl` — do one real `curl` request after deploying to confirm
-end-to-end.
+custom-resource paths are unaffected.
+
+**Known deploy gotcha, found via live testing:** on at least one real deploy,
+AWS reported `AuthType: NONE` correctly set on the Function URL, but the
+`lambda:InvokeFunctionUrl` resource-based policy statement was missing anyway
+(Lambda console showed: *"Your function URL auth type is NONE, but is missing
+permissions required for public access"*) — a plain "no updates to be
+performed" stack update did not fix it, since CloudFormation only diffs
+against its own last-known state, not live drift. `CALambdaUrlPublicInvoke`
+now has an explicit `DependsOn: CALambdaUrl` to guard against this being an
+ordering issue on future deploys. If you still hit this: Lambda console →
+Configuration → Permissions → Add permissions → Policy statement type
+**"Function URL"** → Save. **Do not** also grant plain `lambda:InvokeFunction`
+to `Principal: *`, even though AWS's own banner suggests it — that action is
+exactly what the *admin* direct-invoke path relies on for access control (no
+secret check there), so granting it publicly would let anyone with any AWS
+account bypass `ApiSecret` entirely and reach `bootstrap`/`sign`/`renew` via
+a plain `aws lambda invoke`.
 
 The `renew` action has also been unit-tested locally (fake DynamoDB): renewing
 an active serial issues a new cert for the same `common_name`, links it via

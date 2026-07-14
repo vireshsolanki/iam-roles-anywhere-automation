@@ -314,6 +314,11 @@ Resources:
 
   CALambdaUrlPublicInvoke:
     Type: AWS::Lambda::Permission
+    # Explicit ordering: this grant is meaningless before the Function URL
+    # itself exists, and nothing in Properties references CALambdaUrl (only
+    # CALambda by name), so CloudFormation has no automatic dependency here
+    # unless we say so — without it, the two can be created out of order.
+    DependsOn: CALambdaUrl
     Properties:
       FunctionName: !Ref CALambda
       Action: lambda:InvokeFunctionUrl
