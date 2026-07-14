@@ -1,5 +1,11 @@
 # Security Policy
 
+> **Before reading this doc:** "Role" and "Profile" refer to several different
+> things in this project (IAM Role vs. Roles Anywhere Profile vs. local AWS
+> CLI Profile). See the **[Terminology](README.md#terminology--read-this-before-anything-else-confuses-you)**
+> section in the main README first if any of the sections below are unclear —
+> it'll save you a lot of confusion.
+
 ## Threat Model
 
 ### What We Protect Against

@@ -47,6 +47,24 @@ Both paths produce the same AWS-facing infrastructure: a **Trust Anchor** (tells
 └─────────────────────────────────────────────────────────┘
 ```
 
+### Terminology — read this before anything else confuses you
+
+This project uses the word **"Role"** and **"Profile"** for several *different* things. Getting these mixed up is the #1 source of confusion, so here's the exact meaning of each:
+
+| Term | What it actually is | Where you'll see it |
+|---|---|---|
+| **IAM Role** | The actual AWS permissions container — an `AWS::IAM::Role` resource. This is what grants (or denies) access to S3, DynamoDB, etc. | `--role-arn`, `RoleArn` in CloudFormation outputs |
+| **Roles Anywhere Trust Anchor** | An AWS resource that says "I trust certificates signed by this CA." One per CA, created once, shared by everyone. | `--trust-anchor-arn`, `TrustAnchorArn` output |
+| **Roles Anywhere Profile** | A **different** AWS resource (not an IAM Role!) that says "certificates from this Trust Anchor may assume *these* IAM Roles, for up to *this* session duration." This is the binding between "who you are" (certificate) and "what you can do" (IAM Role). | `--profile-arn`, `ProfileArn` output |
+| **AWS CLI Profile** | A **completely unrelated** concept — a named block in your local `~/.aws/config` file (e.g. `[profile alice-central-ca]`). This is a client-side convenience for selecting which credentials to use; it has nothing to do with the Roles Anywhere Profile above, despite sharing the word "profile." | `aws --profile alice-central-ca ...`, `AWS_PROFILE` env var |
+| **Client** / **Client Identity** | The person, service, or CI job holding a certificate + private key. Identified by the certificate's Common Name (CN), e.g. `CN=alice`. Not an AWS resource — just "whoever has the key." | `--name alice`, `common_name` field |
+
+**The full chain, in plain English:**
+
+> A **Client** (e.g. Alice) has a **certificate**, signed by **your CA**, which AWS trusts because of the **Trust Anchor**. When Alice connects, AWS checks the **Roles Anywhere Profile** to see which **IAM Role(s)** her certificate is allowed to assume, and for how long (session duration). AWS then hands her **temporary credentials** for that IAM Role. Separately, on her own laptop, she might save those credentials under a named **AWS CLI Profile** so she doesn't have to type the full command every time — that last part is 100% local and has nothing to do with AWS's own Roles Anywhere Profile.
+
+If you only remember one thing: **"Roles Anywhere Profile" (AWS-side, binds cert → IAM Role) and "AWS CLI Profile" (local, in `~/.aws/config`) are unrelated, same word, different concepts.**
+
 ---
 
 ## Two Deployment Paths

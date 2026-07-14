@@ -16,3 +16,6 @@ central-ca/lambda/**/__pycache__/
 
 # Local CA bookkeeping
 *.srl
+
+# Social media posts (personal drafts, not part of the project)
+SOCIAL_MEDIA_POSTS.md
