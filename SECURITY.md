@@ -8,7 +8,7 @@
 
 ## Threat Model
 
-### What We Protect Against
+### What This Protects Against
 
 ✅ **Permanent access-key compromise**  
 - Traditional IAM users need long-lived secret keys. A single leak = permanent account access for the attacker.
@@ -30,7 +30,7 @@
 - Who got credentials? When? For what identity? This should be logged.
 - **This project:** DynamoDB tracks every certificate: serial, common_name, issued_at, not_after, revoked_at, revoked_reason, renewed_from. Every action is traced.
 
-### What We Don't Protect Against
+### What This Doesn't Protect Against
 
 ❌ **Compromised IAM Roles**  
 - If an attacker gains control of an IAM role that Roles Anywhere delegates to, they can abuse all credentials issued for that role.
@@ -331,7 +331,7 @@ If you discover a vulnerability in this code:
    - Impact (who/what can be compromised)
    - Suggested fix (if any)
 
-We'll investigate, fix, and credit you in the release notes.
+I'll investigate, fix, and credit you in the release notes.
 
 ---
 
