@@ -24,6 +24,7 @@ Metadata:
           default: 'Operations'
         Parameters:
           - LogRetentionDays
+          - KeyDeletionBreakGlassArn
       - Label:
           default: 'Deployment Source (GitHub) — only change if you forked the repo or moved branches'
         Parameters:
@@ -47,6 +48,8 @@ Metadata:
         default: 'API Gateway API Key Value'
       LogRetentionDays:
         default: 'CloudWatch Log Retention (days)'
+      KeyDeletionBreakGlassArn:
+        default: 'CA Key Deletion Break-Glass Principal (optional)'
       HandlerSourceUrl:
         default: 'handler.py Source URL'
       KmsCaSourceUrl:
@@ -99,6 +102,11 @@ Parameters:
     AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 3653]
     Description: 'How many days to keep CloudWatch Logs for both Lambda functions (issuer + fetcher). Without this, Lambda logs are kept forever by default and cost grows unbounded. Default 30 days.'
 
+  KeyDeletionBreakGlassArn:
+    Type: String
+    Default: ''
+    Description: 'Optional. If set to an IAM principal ARN (e.g. a tightly-controlled break-glass admin role), ONLY that principal may call kms:ScheduleKeyDeletion or kms:DisableKey on the CA key — blocks every other principal in the account, including anyone with AdministratorAccess. Leave blank (default) to skip this extra restriction and rely on the two protections that always apply regardless of this setting: (1) KMS enforces a mandatory 30-day waiting period before a scheduled deletion actually completes, fully reversible with kms:CancelKeyDeletion; (2) the key has DeletionPolicy/UpdateReplacePolicy Retain, so deleting or replacing this CloudFormation stack never touches the key — deletion is always a separate, deliberate action, never a side effect of "aws cloudformation delete-stack".'
+
   ApiKeyValue:
     Type: String
     NoEcho: true
@@ -122,6 +130,9 @@ Parameters:
     Type: String
     Default: 'v1'
     Description: 'Version tag embedded in the S3 object key for the fetched Lambda code (lambda-code-<this>.zip). Bump this (v2, v3, ...) after pushing new code to GitHub and updating this stack, to force a re-fetch and Lambda update — CloudFormation only re-fetches when this value changes.'
+
+Conditions:
+  HasKeyDeletionBreakGlass: !Not [!Equals [!Ref KeyDeletionBreakGlassArn, '']]
 
 Resources:
   # ── Staging bucket: also holds the fetched Lambda zip and (later) ca-certificate.pem / crl.pem ──
@@ -231,12 +242,24 @@ Resources:
       Key: !Sub 'lambda-code-${CodeVersion}.zip'
 
   # ── The CA private key: lives in KMS, cannot be exported ────────────────────
+  # DeletionPolicy/UpdateReplacePolicy Retain: this key must never be deleted
+  # as a SIDE EFFECT of a stack operation (delete-stack, or an update that
+  # happens to replace it) — losing it means every existing certificate is
+  # still cryptographically valid but nothing new can ever be signed again
+  # (no new certs, no renewals, no CRL updates). Actual deletion must always
+  # be a separate, deliberate `aws kms schedule-key-deletion` call.
   CAKey:
     Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       Description: !Sub '${ProjectName} Root CA signing key (asymmetric, sign/verify)'
       KeySpec: RSA_2048
       KeyUsage: SIGN_VERIFY
+      # Explicit (default is also 30, but stated here so it's not a surprise):
+      # a scheduled deletion waits this many days before actually completing,
+      # fully reversible with kms:CancelKeyDeletion during the window.
+      PendingWindowInDays: 30
       KeyPolicy:
         Version: '2012-10-17'
         Statement:
@@ -246,6 +269,20 @@ Resources:
               AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
             Action: 'kms:*'
             Resource: '*'
+          - !If
+            - HasKeyDeletionBreakGlass
+            - Sid: DenyDeletionExceptBreakGlass
+              Effect: Deny
+              Principal:
+                AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+              Action:
+                - kms:ScheduleKeyDeletion
+                - kms:DisableKey
+              Resource: '*'
+              Condition:
+                StringNotEquals:
+                  'aws:PrincipalArn': !Ref KeyDeletionBreakGlassArn
+            - !Ref 'AWS::NoValue'
 
   CAKeyAlias:
     Type: AWS::KMS::Alias
@@ -305,6 +342,17 @@ Resources:
                   - s3:GetObject
                   - s3:PutObject
                 Resource: !Sub '${ArtifactBucket.Arn}/*'
+              - Sid: CrlEnforcement
+                Effect: Allow
+                # Roles Anywhere doesn't support resource-level scoping for
+                # these actions the way KMS/DynamoDB/S3 do above (ImportCrl in
+                # particular associates a not-yet-existing CRL resource), so
+                # this is intentionally account-wide rather than ARN-scoped.
+                Action:
+                  - rolesanywhere:ImportCrl
+                  - rolesanywhere:UpdateCrl
+                  - rolesanywhere:ListTrustAnchors
+                Resource: '*'
 
   CALambda:
     Type: AWS::Lambda::Function
@@ -326,6 +374,11 @@ Resources:
           CA_KEY_ID: !Ref CAKey
           TABLE_NAME: !Ref CertTable
           BUCKET_NAME: !Ref ArtifactBucket
+          # Used to find the Trust Anchor by name (list_trust_anchors) when
+          # registering a CRL — NOT !Ref TrustAnchor, which would create a
+          # circular dependency (TrustAnchor depends on CABootstrap depends
+          # on CALambda). ProjectName is just a Parameter, so no cycle.
+          PROJECT_NAME: !Ref ProjectName
           CA_CN: !Ref CACommonName
           CA_ORG: !Ref CAOrg
           CA_COUNTRY: !Ref CACountry

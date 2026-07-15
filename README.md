@@ -83,6 +83,16 @@ None of these are the kind of thing you'd write from first principles without ha
 └─────────────────────────────────────────────────────────┘
 ```
 
+### Visual Architecture Diagrams
+
+For a complete breakdown of each flow, you can view the [Interactive Flow Dashboard](flow-diagram.html) in your browser. Below are the static high-resolution architecture diagrams for both patterns:
+
+#### Central CA Pattern (AWS KMS-backed Production CA)
+![Central CA Architecture Flow](central-flow.png)
+
+#### Local CA Pattern (Laptop-managed CA for POCs)
+![Local CA Architecture Flow](local-flow.png)
+
 ### Terminology — read this before anything else confuses you
 
 This project uses the word **"Role"** and **"Profile"** for several *different* things. Getting these mixed up is the #1 source of confusion, so here's the exact meaning of each:
@@ -363,7 +373,7 @@ See [SECURITY.md](SECURITY.md) for detailed threat model and mitigations.
 │   ├── central-ca-stack.yml        ← CloudFormation (everything auto-bootstraps)
 │   ├── request-cert.sh             ← Onboard users (admin or public endpoint)
 │   ├── lambda/
-│   │   ├── handler.py              ← Lambda (bootstrap, sign, renew, revoke, crl)
+│   │   ├── handler.py              ← Lambda (bootstrap, sign, renew, revoke, crl, rotate_ca)
 │   │   └── kms_ca.py               ← Hand-rolled X.509/DER encoder, KMS signing
 │   └── [generated at runtime]
 │       └── client-bob/
