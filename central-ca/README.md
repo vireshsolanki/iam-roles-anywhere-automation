@@ -84,8 +84,10 @@ Five actions, one Lambda ([lambda/handler.py](lambda/handler.py)):
 | `bootstrap` | admin | Create the self-signed Root CA cert from the KMS key (once, on stack deploy). |
 | `sign` | admin, or a dev via the public endpoint | Sign a user public key → client certificate. |
 | `renew` | admin only | Issue a fresh cert for an existing identity, revoke the old one. |
-| `revoke` | admin only | Mark a serial revoked in DynamoDB. |
-| `crl` | admin only | Regenerate the CRL from revoked entries and register it with Roles Anywhere. |
+| `revoke` | admin only | Permanently revoke a serial and immediately enforce it (auto-publishes CRL). Never reversible. |
+| `disable` | admin only | Temporarily block a serial and immediately enforce it (auto-publishes CRL). Reversible via `enable`. |
+| `enable` | admin only | Reverse a `disable` (never a `revoke`) and immediately re-permit it (auto-publishes CRL). |
+| `crl` | admin only | Standalone CRL rebuild + Roles Anywhere registration — for batch revocation or periodic freshness refresh. |
 | `rotate_ca` | admin only | Re-self-sign a fresh Root CA cert from the same KMS key, before `CACertValidityDays` expires. |
 
 ## Stack layout
@@ -379,35 +381,77 @@ onboarded users.
 `rotate_ca` is admin-only, same reasoning as `renew` — never reachable over
 the public API endpoint.
 
-## Revoke a user
+## Revoke a user (permanent)
 
-**Lambda console** → `CentralCA-issuer` → **Test** → new events:
+**Lambda console** → `CentralCA-issuer` → **Test** → new event:
 ```json
 { "action": "revoke", "serial": "<their serial>" }
 ```
-then
-```json
-{ "action": "crl", "days": 7 }
-```
-`revoke` marks the serial revoked in DynamoDB. `crl` does the part that
-actually matters: it regenerates `crl.pem`, writes it to S3, **and registers
-it with Roles Anywhere** — `rolesanywhere:ImportCrl` the first time this ever
-runs on a stack, `rolesanywhere:UpdateCrl` on every call after (the Lambda
-looks up your Trust Anchor by name and remembers the resulting `crlId` in
-DynamoDB, so you never have to pass it yourself). That registration step is
-what makes AWS actually reject the revoked certificate — writing `crl.pem` to
-S3 by itself does nothing; Roles Anywhere only enforces a CRL it has been
-explicitly told about via `ImportCrl`/`UpdateCrl`. The response includes a
-`roles_anywhere_registration` field confirming `imported` or `updated` (or
-`skipped` with a reason, if the Trust Anchor isn't found — re-run `crl` once
-it exists).
+That's the whole thing — **one call**. `revoke` marks the serial revoked in
+DynamoDB, then immediately builds a fresh CRL from every currently-revoked
+serial, writes it to S3, and **registers it with Roles Anywhere**
+(`rolesanywhere:ImportCrl` the first time this ever runs on a stack,
+`rolesanywhere:UpdateCrl` on every call after — the Lambda looks up your Trust
+Anchor by name and remembers the resulting `crlId` in DynamoDB, so you never
+pass it yourself). That registration step is what makes AWS actually reject
+the certificate — writing `crl.pem` to S3 by itself does nothing; Roles
+Anywhere only enforces a CRL it has been explicitly told about. Check the
+response's `roles_anywhere_registration` field for `imported` or `updated`
+(or `skipped` with a reason, if the Trust Anchor isn't found yet).
 
-`revoke` is **admin-only** — it is never reachable over the public API
-endpoint, even with a valid API key. The public endpoint's only capability is
-`sign`: a dev can request their own certificate there, but can't revoke or
-reissue anything, theirs or anyone else's. Revocation always goes through the
-admin path above (`revoke`, then `crl` to actually make AWS start rejecting
-it).
+Optional fields: `"crl_days"` (default 7 — how long the *published CRL
+document* stays fresh before it should be regenerated; unrelated to how long
+the revocation lasts, which is forever) and `"reason"` (stored as
+`revoked_reason` for the audit trail, e.g. `"compromised"`).
+
+**This is permanent.** No action anywhere — not `renew`, not anything else —
+can ever flip a revoked serial back to active. `renew` explicitly refuses a
+revoked serial (`renew` internally revokes the *old* serial through this same
+`revoke` logic, so it publishes too). To give someone access again after a
+revocation, issue them a **completely fresh certificate** (`sign` again) — see
+"Automating onboarding" above. If you want a *reversible* suspension instead
+of permanent revocation, use `disable`/`enable` below.
+
+`revoke` is **admin-only** — never reachable over the public API endpoint,
+even with a valid API key. The public endpoint's only capability is `sign`: a
+dev can request their own certificate there, but can't revoke or reissue
+anything, theirs or anyone else's.
+
+## Temporarily suspend a user (reversible)
+
+For a planned, brief suspension — a contractor between engagements, someone
+on leave — where you want to block access *now* and restore the exact same
+certificate *later*, without the "permanent, reissue required" consequence of
+`revoke`:
+
+```json
+{ "action": "disable", "serial": "<their serial>", "reason": "on leave" }
+```
+Blocks it identically to `revoke` (same CRL publish, same immediate
+enforcement) — AWS has no concept of "temporary" at the CRL level, a serial is
+either on the list or it isn't. The difference is entirely in what this
+project tracks: `status` becomes `"disabled"`, not `"revoked"`.
+
+To restore it:
+```json
+{ "action": "enable", "serial": "<their serial>" }
+```
+Flips it back to `"active"` and republishes the CRL **without** that serial —
+the same certificate + private key work again immediately. `enable` only ever
+works on a serial whose status is exactly `"disabled"` — trying it on a
+`"revoked"` serial is refused with a clear error, which is what keeps `revoke`
+a real permanence guarantee. There is no way to enable your way around a
+revocation.
+
+**Think about what you're accepting before using `enable`:** reactivating the
+same keypair doesn't prove anything new about who currently holds that
+private key — it's the same proof-of-possession as when it was first issued,
+now just... resumed. Fine for a planned suspension where you trust the
+certificate holder hasn't changed. Not fine for anything involving suspected
+key compromise — use `revoke` and a fresh `sign` for that instead.
+
+Both `disable` and `enable` are **admin-only**, same as `revoke` — never
+reachable over the public API endpoint.
 
 ## Per-user permissions (2000 users, one role)
 

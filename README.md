@@ -22,18 +22,16 @@ Both paths produce the same AWS-facing infrastructure: a **Trust Anchor** (tells
 
 A few other public repos cover related ground. Worth being precise about what each one actually is, since they solve different (sometimes overlapping) problems:
 
-| | **This repo (Central CA)** | **This repo (Local CA)** | [aws/rolesanywhere-credential-helper](https://github.com/aws/rolesanywhere-credential-helper) | [aws-samples/sample-...-demo](https://github.com/aws-samples/sample-aws-iam-roles-anywhere-demo) | [aws-samples/sample-...-automation](https://github.com/aws-samples/sample-aws-iam-roles-anywhere-automation) |
-|---|---|---|---|---|---|
-| **What it is** | Full CA + issuance pipeline | Full CA + issuance pipeline | Client-side credential tool only | Educational demo | Full CA + issuance automation |
-| **CA type** | AWS KMS (never exportable) | Laptop OpenSSL | N/A — not a CA | Laptop OpenSSL (self-signed) | AWS ACM Private CA |
-| **Monthly cost** | ~$1.25–2.50 (see below) | ~$0 | N/A | ~$0 | **$400+** (ACM Private CA) |
-| **Says it's production-ready?** | Yes | For solo/small use | Yes (official AWS binary) | **No** — explicitly labeled "Not Production-Ready" | Claims yes |
-| **Cert renewal** | Automatic, old cert auto-revoked | Manual re-run | N/A | Not implemented | Not detailed in the repo |
-| **Revocation / CRL** | DynamoDB + CRL, enforced in seconds | Manual | N/A | Not implemented | Not detailed in the repo |
-| **Audit trail** | DynamoDB (full lifecycle: issued/renewed/revoked) | None built-in | N/A | CloudTrail only | Not detailed in the repo |
-| **Zero-AWS-credential onboarding** | Yes (API Gateway + API key) | No | N/A | No | No |
-
-**Important distinction:** `aws/rolesanywhere-credential-helper` isn't a competing CA solution — it's the **official `aws_signing_helper` binary**, and this project uses that exact same binary. Every `client-<name>/` directory this project generates downloads and wraps it. We're not reinventing the client side, only the CA and issuance pipeline around it.
+| | **This repo (Central CA)** | **This repo (Local CA)** | [aws-samples/sample-...-demo](https://github.com/aws-samples/sample-aws-iam-roles-anywhere-demo) | [aws-samples/sample-...-automation](https://github.com/aws-samples/sample-aws-iam-roles-anywhere-automation) |
+|---|---|---|---|---|
+| **What it is** | Full CA + issuance pipeline | Full CA + issuance pipeline | Educational demo | Full CA + issuance automation |
+| **CA type** | AWS KMS (never exportable) | Laptop OpenSSL | Laptop OpenSSL (self-signed) | AWS ACM Private CA |
+| **Monthly cost** | ~$1.25–2.50 (see below) | ~$0 | ~$0 | **$400+** (ACM Private CA) |
+| **Says it's production-ready?** | Yes | For solo/small use | **No** — explicitly labeled "Not Production-Ready" | Claims yes |
+| **Cert renewal** | Automatic, old cert auto-revoked | Manual re-run | Not implemented | Not detailed in the repo |
+| **Revocation** | DynamoDB + CRL, enforced within seconds; permanent (`revoke`) or reversible (`disable`/`enable`) | Manual | Not implemented | Not detailed in the repo |
+| **Audit trail** | DynamoDB (full lifecycle: issued/renewed/revoked/disabled) | None built-in | CloudTrail only | Not detailed in the repo |
+| **Zero-AWS-credential onboarding** | Yes (API Gateway + API key, issuance-only) | No | No | No |
 
 **The comparison that actually matters:** `sample-aws-iam-roles-anywhere-automation` is the closest thing to a real alternative — it's genuinely well-automated. But it deploys **ACM Private CA**, which is the $400/month cost this entire project exists to eliminate. If you're fine paying for ACM Private CA, that repo is a solid choice. If the cost is the blocker (which is why most people end up here), this project reaches the same Roles Anywhere end-state for a couple of dollars a month instead.
 
@@ -41,7 +39,7 @@ A few other public repos cover related ground. Worth being precise about what ea
 
 ## Why Trust This Isn't Just Generated Boilerplate
 
-A fair question for any infra repo today. Two ways to check for yourself rather than take our word for it:
+A fair question for any infra repo today. Two ways to check for yourself rather than take my word for it:
 
 **1. The cryptography is small enough to actually read.** [kms_ca.py](central-ca/lambda/kms_ca.py) is a ~240-line, dependency-free X.509/DER encoder — no `cryptography` package, no OpenSSL bindings, just `hashlib` + `base64` + hand-written ASN.1 TLV encoding. Read it in ten minutes and you've audited 100% of the certificate-generation logic. Nothing is hidden behind an imported library you have to trust blindly.
 
@@ -239,20 +237,21 @@ Traditional IAM users require long-lived secret access keys — a single leak co
 ### Automatic Certificate Lifecycle
 
 - **Issue** certificates instantly (5–30 seconds)
-- **Renew** with automatic old-cert revocation (one valid cert per identity)
-- **Revoke** immediately (CRL updated, AWS rejects within seconds)
-- **Track everything** in DynamoDB (serial, CN, issued_at, revoked_reason, etc.)
+- **Renew** with automatic old-cert revocation (one valid cert per identity) — the old cert's revocation is enforced immediately too, not just recorded
+- **Revoke** permanently — one call marks it revoked *and* publishes the CRL to Roles Anywhere in the same step, so it's actually rejected within seconds, not just logged
+- **Disable / enable** for reversible suspension (a contractor between engagements, someone on leave) — blocked identically to a revoke while disabled, restorable to the exact same certificate via `enable`, but `enable` can never touch a truly revoked serial — that stays permanent
+- **Track everything** in DynamoDB (serial, CN, issued_at, revoked_reason, disabled_reason, renewed_from, etc.)
 
 ### Zero-Trust Developer Onboarding
 
-Central CA includes a **public HTTPS API Gateway endpoint** (shared secret auth, no AWS IAM required):
+Central CA includes a **public HTTPS API Gateway endpoint** (API key auth, no AWS IAM required) — **issuance only**, nothing else:
 ```bash
 curl -X POST "https://api.example.com/issue" \
   -H "x-api-key: <shared-secret>" \
   -H "Content-Type: application/json" \
   -d '{"action":"sign", "common_name":"alice", "public_key":"...", "days":30}'
 ```
-Developers **never touch AWS credentials**. Admin shares only the endpoint URL and API key.
+Developers **never touch AWS credentials**, and this endpoint can only ever issue a certificate — not revoke, renew, disable, or reissue anything, theirs or anyone else's. Every other lifecycle action requires admin IAM credentials. Admin shares only the endpoint URL and API key.
 
 ### Cost Breakdown
 
@@ -441,10 +440,16 @@ The Trust Anchor must match the CA cert that signed the client cert. Regeneratin
 A: Yes. Mount the private key + certificate as secrets, use `aws_signing_helper` as the `credential_process` in a container's AWS CLI config.
 
 **Q: What if I lose the root CA private key (Local CA)?**  
-A: Permanently lost — all existing certs become invalid. Regenerate the CA (new Trust Anchor) and reissue all certificates. This is why we recommend Central CA (KMS) for production.
+A: Permanently lost — all existing certs become invalid. Regenerate the CA (new Trust Anchor) and reissue all certificates. This is why I recommend Central CA (KMS) for production.
 
 **Q: Can I export the KMS key to use it elsewhere (Central CA)?**  
 A: No — KMS asymmetric keys are un-extractable by design. Signing only happens via `kms:Sign`. This is the security boundary.
+
+**Q: Who can delete the CA's KMS key (Central CA)?**  
+A: By default, only the literal AWS account **root** login — every IAM role or user is blocked regardless of its own permissions, even `AdministratorAccess`. Stack deletion never touches it either way (`DeletionPolicy: Retain`). See [SECURITY.md](SECURITY.md) for the full picture.
+
+**Q: I revoked someone by mistake — can I undo it?**  
+A: Not if you used `revoke` — that's permanent by design, and the fix is issuing them a fresh certificate. If you only wanted a temporary block (a contractor between engagements, someone on leave), use `disable` instead of `revoke` next time — it's reversible via `enable`, restoring the exact same certificate. See [central-ca/README.md](central-ca/README.md) for both.
 
 **Q: How many users can this scale to?**  
 A: Local CA: 1–10 (laptop performance/backup burden). Central CA: 1000s (DynamoDB on-demand, Lambda auto-scaling, API Gateway auto-scaling).

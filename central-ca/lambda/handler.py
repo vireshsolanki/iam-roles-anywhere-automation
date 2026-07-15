@@ -14,18 +14,46 @@ Actions (payload {"action": ...}):
               at a time). Admin-only, not reachable over the HTTP API — the
               old serial alone isn't proof of key possession, so self-service
               renewal isn't safe without a stronger identity check.
-  revoke    : mark an issued serial revoked in DynamoDB. Admin-only, not
-              reachable over the HTTP API — a dev can request their own
-              certificate there, but can never revoke or reissue anything,
-              theirs or anyone else's.
-  crl       : regenerate the CRL from revoked entries, store in S3, AND
-              register it with Roles Anywhere (rolesanywhere:ImportCrl the
-              first time, rolesanywhere:UpdateCrl after) so revocation is
-              actually enforced by AWS -- writing crl.pem to S3 alone does
-              nothing; Roles Anywhere only checks a CRL it has been told
-              about. The Trust Anchor is found by name (no circular
-              CloudFormation dependency needed), and the returned crlId is
-              cached in DynamoDB so subsequent calls update in place.
+  revoke    : mark an issued serial revoked in DynamoDB, THEN immediately
+              publish/register the updated CRL with Roles Anywhere (see
+              "crl" below) so the revocation is actually enforced, not just
+              recorded -- there's no scenario where marking a single serial
+              revoked without publishing is useful, so this always does
+              both. Optional "crl_days" (default 7) controls the published
+              CRL's freshness window; optional "reason" is stored as
+              revoked_reason. Admin-only, not reachable over the HTTP API —
+              a dev can request their own certificate there, but can never
+              revoke or reissue anything, theirs or anyone else's. renew
+              (below) also routes its old-serial revocation through this
+              same function, for the same reason. THIS IS PERMANENT -- no
+              action ever flips a revoked serial back to active. For
+              temporary access suspension, use disable/enable instead.
+  disable   : temporarily block a serial (status "disabled", distinct from
+              "revoked") and publish the CRL, same as revoke -- AWS enforces
+              both identically, since X.509 CRLs have no concept of
+              "temporary", only "on the list or not". The difference is
+              entirely in what we track and whether it can be undone.
+  enable    : reverse a disable, reactivating the SAME certificate, and
+              republish the CRL without that serial. Only ever works on a
+              serial whose status is exactly "disabled" -- a revoked serial
+              can never be enabled, preserving revoke's permanence
+              guarantee. Reactivating the same keypair doesn't prove
+              anything new about who currently holds the private key, so
+              use this only when that's an acceptable tradeoff (e.g. a
+              planned, brief suspension) -- for anything involving suspected
+              key compromise, revoke and issue a fresh certificate instead.
+  crl       : regenerate the CRL from ALL currently-revoked/disabled entries, store
+              in S3, AND register it with Roles Anywhere
+              (rolesanywhere:ImportCrl the first time, rolesanywhere:UpdateCrl
+              after) so revocation is actually enforced by AWS -- writing
+              crl.pem to S3 alone does nothing; Roles Anywhere only checks a
+              CRL it has been told about. The Trust Anchor is found by name
+              (no circular CloudFormation dependency needed), and the
+              returned crlId is cached in DynamoDB so subsequent calls
+              update in place. Useful standalone for: batch revocation
+              (revoke many serials directly via DynamoDB or a script, then
+              publish once) or simply refreshing the CRL's freshness window
+              periodically even when nothing new was revoked.
   rotate_ca : re-self-sign a FRESH Root CA certificate from the SAME KMS key
               (bypasses the one-time bootstrap guard). Admin-only. The public
               key -- and therefore the AuthorityKeyIdentifier every existing
@@ -115,7 +143,11 @@ def handler(event, context):
         if action == "renew":
             return _renew(event)
         if action == "revoke":
-            return _revoke(event["serial"])
+            return _revoke(event["serial"], int(event.get("crl_days", 7)), event.get("reason"))
+        if action == "disable":
+            return _disable(event["serial"], int(event.get("crl_days", 7)), event.get("reason"))
+        if action == "enable":
+            return _enable(event["serial"], int(event.get("crl_days", 7)))
         if action == "crl":
             return _crl(int(event.get("days", 7)))
         if action == "rotate_ca":
@@ -267,12 +299,12 @@ def _renew(event):
     common_name = old_item["common_name"]
     result = _issue(common_name, public_key, days, renewed_from=old_serial)
 
-    table.update_item(
-        Key={"serial": old_serial},
-        UpdateExpression="SET #s = :r, revoked_at = :t, revoked_reason = :reason",
-        ExpressionAttributeNames={"#s": "status"},
-        ExpressionAttributeValues={":r": "revoked", ":t": _now_iso(), ":reason": "renewed"},
-    )
+    # Routed through _revoke() (not a direct table update) specifically so
+    # the old serial's revocation also gets published/enforced immediately
+    # -- same reasoning as the standalone revoke action: marking DynamoDB
+    # without publishing the CRL leaves the just-replaced cert still usable.
+    revoke_result = _revoke(old_serial, int(event.get("crl_days", 7)), reason="renewed")
+    result["old_serial_revocation"] = revoke_result
     return result
 
 
@@ -295,42 +327,113 @@ def _issue(common_name, public_key, days, renewed_from=None):
     return {"serial": str(serial), "common_name": common_name, "certificate": cert_pem.decode()}
 
 
-def _revoke(serial):
+def _revoke(serial, crl_days=7, reason=None):
+    # Marking DynamoDB alone enforces nothing -- AWS doesn't know this
+    # serial exists until a CRL naming it is published. There is no
+    # legitimate reason to do one without the other for a single
+    # revocation, so this always publishes immediately; _crl remains
+    # available standalone for batch revokes (mark many, publish once)
+    # and for periodic re-publishing to keep the CRL's freshness window
+    # (nextUpdate) current even when nothing new was revoked.
     serial = str(serial)
     if not table.get_item(Key={"serial": serial}).get("Item"):
         raise KeyError(serial)
+    update_expr = "SET #s = :r, revoked_at = :t"
+    expr_values = {":r": "revoked", ":t": _now_iso()}
+    if reason:
+        update_expr += ", revoked_reason = :reason"
+        expr_values[":reason"] = reason
     table.update_item(
         Key={"serial": serial},
-        UpdateExpression="SET #s = :r, revoked_at = :t",
+        UpdateExpression=update_expr,
         ExpressionAttributeNames={"#s": "status"},
-        ExpressionAttributeValues={":r": "revoked", ":t": _now_iso()},
+        ExpressionAttributeValues=expr_values,
     )
-    return {"serial": serial, "status": "revoked"}
+    return {"serial": serial, "status": "revoked", **_publish_crl(crl_days)}
+
+
+def _disable(serial, crl_days=7, reason=None):
+    # A DIFFERENT status from "revoked" -- reversible via _enable. AWS enforces
+    # both identically (a serial in the CRL is blocked, full stop; X.509 CRLs
+    # have no concept of "temporary"), so the only real difference is what we
+    # track in DynamoDB and whether a later action is allowed to undo it.
+    serial = str(serial)
+    item = table.get_item(Key={"serial": serial}).get("Item")
+    if not item:
+        raise KeyError(serial)
+    if item.get("status") != "active":
+        return {"error": f"serial {serial} is not active (status={item.get('status')!r}); cannot disable"}
+    update_expr = "SET #s = :d, disabled_at = :t"
+    expr_values = {":d": "disabled", ":t": _now_iso()}
+    if reason:
+        update_expr += ", disabled_reason = :reason"
+        expr_values[":reason"] = reason
+    table.update_item(
+        Key={"serial": serial},
+        UpdateExpression=update_expr,
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues=expr_values,
+    )
+    return {"serial": serial, "status": "disabled", **_publish_crl(crl_days)}
+
+
+def _enable(serial, crl_days=7):
+    # Only reverses _disable, never _revoke -- status must be exactly
+    # "disabled". This is what keeps "revoked" a real permanence guarantee:
+    # there is no code path that ever flips a revoked serial back to active.
+    serial = str(serial)
+    item = table.get_item(Key={"serial": serial}).get("Item")
+    if not item:
+        raise KeyError(serial)
+    if item.get("status") != "disabled":
+        return {
+            "error": (
+                f"serial {serial} is not disabled (status={item.get('status')!r}); "
+                "cannot enable -- only temporarily-disabled serials can be "
+                "re-enabled, revoked ones are permanent"
+            )
+        }
+    table.update_item(
+        Key={"serial": serial},
+        UpdateExpression="SET #s = :a REMOVE disabled_at, disabled_reason",
+        ExpressionAttributeNames={"#s": "status"},
+        ExpressionAttributeValues={":a": "active"},
+    )
+    return {"serial": serial, "status": "active", **_publish_crl(crl_days)}
 
 
 def _crl(days_valid):
-    revoked = []
+    return _publish_crl(days_valid)
+
+
+def _publish_crl(days_valid):
+    # Both "revoked" (permanent) and "disabled" (temporary) must be in the
+    # CRL -- AWS has no concept of the distinction, both simply mean "don't
+    # trust this serial right now".
+    blocked = []
     kwargs = {
-        "FilterExpression": "#s = :r",
+        "FilterExpression": "#s = :r OR #s = :d",
         "ExpressionAttributeNames": {"#s": "status"},
-        "ExpressionAttributeValues": {":r": "revoked"},
+        "ExpressionAttributeValues": {":r": "revoked", ":d": "disabled"},
     }
     while True:
         scan = table.scan(**kwargs)
         for item in scan.get("Items", []):
-            revoked.append(
-                {"serial": int(item["serial"]), "revoked_at": _parse_iso(item["revoked_at"])}
-            )
+            # revoked_at for permanently-revoked items, disabled_at for
+            # temporarily-disabled ones -- whichever is present is when this
+            # serial stopped being trusted.
+            at = item.get("revoked_at") or item.get("disabled_at")
+            blocked.append({"serial": int(item["serial"]), "revoked_at": _parse_iso(at)})
         if "LastEvaluatedKey" not in scan:
             break
         kwargs["ExclusiveStartKey"] = scan["LastEvaluatedKey"]
 
     crl_number = _next_crl_number()
-    crl_pem = kms_ca.build_crl(CA_KEY_ID, CA_CN, CA_ORG, CA_COUNTRY, revoked, days_valid, crl_number)
+    crl_pem = kms_ca.build_crl(CA_KEY_ID, CA_CN, CA_ORG, CA_COUNTRY, blocked, days_valid, crl_number)
     s3.put_object(Bucket=BUCKET_NAME, Key=CRL_KEY, Body=crl_pem)
     registration = _register_crl_with_roles_anywhere(crl_pem)
     return {
-        "revoked_count": len(revoked),
+        "revoked_count": len(blocked),
         "crl_number": crl_number,
         "s3": f"s3://{BUCKET_NAME}/{CRL_KEY}",
         "roles_anywhere_registration": registration,
