@@ -83,6 +83,18 @@ None of these are the kind of thing you'd write from first principles without ha
 └─────────────────────────────────────────────────────────┘
 ```
 
+### Visual Architecture Diagrams
+
+#### Central CA Pattern (AWS KMS-backed Production CA)
+![Central CA Architecture Flow — Admin Laptop deploys via CloudFormation, which provisions a Fetcher Lambda, KMS CA Key, Issuer Lambda, S3 bucket, DynamoDB cert index, API Gateway, and Roles Anywhere Trust Anchor/Profile; a Developer Laptop reaches the Issuer Lambda through API Gateway to obtain a certificate and assume the target IAM Role](central-flow.png)
+
+Numbered flow: (1–3) admin deploys the stack, which bootstraps the KMS key and issuer Lambda; (4) the public API Gateway and the issuer Lambda are wired together; (5, 13, 17) a developer requests and receives a certificate through the public endpoint, with no AWS credentials of their own; (9–11, 15–16) every signature and revocation is recorded in S3 and DynamoDB; (12, 14) the resulting certificate lets the developer's laptop assume the target IAM Role via the Roles Anywhere Trust Anchor/Profile.
+
+#### Local CA Pattern (Laptop-managed CA for POCs)
+![Local CA Architecture Flow — Admin Laptop holds the CA private key locally, deploys the Trust Anchor and IAM Role via CloudFormation, and issues certificates directly to a Developer Laptop, which presents its certificate to the Trust Anchor to assume the IAM Role](local-flow.png)
+
+Numbered flow: (2–3) the admin deploys the Trust Anchor + Role via CloudFormation; (4) the admin issues a certificate directly from the laptop-held CA private key; (5–6) the developer's laptop presents that certificate to the Trust Anchor and assumes the IAM Role. No Lambda, KMS, or public endpoint in this path — everything routes through the admin's own machine, which is exactly the tradeoff that makes Central CA the better fit past a handful of users.
+
 ### Terminology — read this before anything else confuses you
 
 This project uses the word **"Role"** and **"Profile"** for several *different* things. Getting these mixed up is the #1 source of confusion, so here's the exact meaning of each:
@@ -363,7 +375,7 @@ See [SECURITY.md](SECURITY.md) for detailed threat model and mitigations.
 │   ├── central-ca-stack.yml        ← CloudFormation (everything auto-bootstraps)
 │   ├── request-cert.sh             ← Onboard users (admin or public endpoint)
 │   ├── lambda/
-│   │   ├── handler.py              ← Lambda (bootstrap, sign, renew, revoke, crl)
+│   │   ├── handler.py              ← Lambda (bootstrap, sign, renew, revoke, crl, rotate_ca)
 │   │   └── kms_ca.py               ← Hand-rolled X.509/DER encoder, KMS signing
 │   └── [generated at runtime]
 │       └── client-bob/

@@ -14,8 +14,27 @@ Actions (payload {"action": ...}):
               at a time). Admin-only, not reachable over the HTTP API — the
               old serial alone isn't proof of key possession, so self-service
               renewal isn't safe without a stronger identity check.
-  revoke    : mark an issued serial revoked in DynamoDB.
-  crl       : regenerate the CRL from revoked entries, store in S3.
+  revoke    : mark an issued serial revoked in DynamoDB. Admin-only, not
+              reachable over the HTTP API — a dev can request their own
+              certificate there, but can never revoke or reissue anything,
+              theirs or anyone else's.
+  crl       : regenerate the CRL from revoked entries, store in S3, AND
+              register it with Roles Anywhere (rolesanywhere:ImportCrl the
+              first time, rolesanywhere:UpdateCrl after) so revocation is
+              actually enforced by AWS -- writing crl.pem to S3 alone does
+              nothing; Roles Anywhere only checks a CRL it has been told
+              about. The Trust Anchor is found by name (no circular
+              CloudFormation dependency needed), and the returned crlId is
+              cached in DynamoDB so subsequent calls update in place.
+  rotate_ca : re-self-sign a FRESH Root CA certificate from the SAME KMS key
+              (bypasses the one-time bootstrap guard). Admin-only. The public
+              key -- and therefore the AuthorityKeyIdentifier every existing
+              client certificate was signed against -- doesn't change, so
+              already-issued certificates keep validating once you update the
+              Trust Anchor's X509CertificateData to this new certificate. Use
+              this before CACertValidityDays runs out; there is no automatic
+              renewal, since _bootstrap() deliberately refuses to ever
+              overwrite the CA cert on its own.
 
 DynamoDB (CertTable) is the single source of truth for every certificate ever
 issued: serial, common_name, status (active/revoked), issued_at, not_after,
@@ -31,14 +50,16 @@ There are three ways this function is invoked, auto-detected from the event shap
 
   2. API Gateway REST API (Lambda proxy — has top-level "httpMethod") — a
      public HTTPS endpoint (see the ApiEndpoint output) that lets a caller
-     with NO AWS credentials request/revoke a certificate. Authentication is
+     with NO AWS credentials request their OWN certificate. Authentication is
      handled ENTIRELY by API Gateway: the method requires an API key (the
      "x-api-key" header), so only requests with a valid key ever reach this
      function — there is no secret check in this code. This function is not
      directly invokable by anyone except API Gateway (its resource policy
      only trusts apigateway.amazonaws.com) and the admin (path 3, via IAM).
-     Only "sign" and "revoke" are allowed here; "bootstrap"/"renew"/"crl"
-     return 403 even with a valid key. Routed to _http_handler.
+     "sign" is the ONLY action allowed here — every other action, including
+     "revoke", returns 403 even with a valid key. A dev can obtain a
+     certificate; they cannot revoke or reissue anything, theirs or anyone
+     else's. Routed to _http_handler.
 
   3. Direct `aws lambda invoke` with a raw {"action": ...} payload — the
      admin's own tooling (request-cert.sh --lambda, the Lambda console Test
@@ -47,8 +68,10 @@ There are three ways this function is invoked, auto-detected from the event shap
      access control. Supports all five actions, including "bootstrap",
      "renew", and "crl" which are intentionally never exposed publicly.
 
-Environment: CA_KEY_ID, TABLE_NAME, BUCKET_NAME, CA_CN, CA_ORG, CA_COUNTRY.
+Environment: CA_KEY_ID, TABLE_NAME, BUCKET_NAME, PROJECT_NAME, CA_CN, CA_ORG,
+CA_COUNTRY.
 """
+import base64
 import datetime
 import json
 import os
@@ -61,16 +84,19 @@ import kms_ca
 CA_KEY_ID = os.environ["CA_KEY_ID"]
 TABLE_NAME = os.environ["TABLE_NAME"]
 BUCKET_NAME = os.environ["BUCKET_NAME"]
+PROJECT_NAME = os.environ["PROJECT_NAME"]
 CA_CN = os.environ.get("CA_CN", "Central-RootCA")
 CA_ORG = os.environ.get("CA_ORG", "MyOrg")
 CA_COUNTRY = os.environ.get("CA_COUNTRY", "US")
 
 CA_CERT_KEY = "ca-certificate.pem"
 CRL_KEY = "crl.pem"
-HTTP_ALLOWED_ACTIONS = {"sign", "revoke"}
+CRL_ID_RECORD_KEY = "__crl_id__"
+HTTP_ALLOWED_ACTIONS = {"sign"}  # issuance only -- devs can never revoke/renew/reissue over this path
 
 s3 = boto3.client("s3")
 table = boto3.resource("dynamodb").Table(TABLE_NAME)
+rolesanywhere = boto3.client("rolesanywhere")
 
 
 def handler(event, context):
@@ -92,6 +118,8 @@ def handler(event, context):
             return _revoke(event["serial"])
         if action == "crl":
             return _crl(int(event.get("days", 7)))
+        if action == "rotate_ca":
+            return _rotate_ca(int(event.get("days", 3650)))
         return {"error": f"unknown action: {action!r}"}
     except KeyError as exc:
         return {"error": f"missing field: {exc}"}
@@ -111,7 +139,10 @@ def _is_http_event(event):
 def _http_handler(event):
     # No secret check here on purpose: API Gateway already rejected any request
     # without a valid API key before it reached us. We only restrict WHICH
-    # actions are allowed over the public path.
+    # actions are allowed over the public path -- "sign" and nothing else.
+    # A dev can request a certificate; they cannot revoke or reissue anything,
+    # theirs or anyone else's. All lifecycle management past initial issuance
+    # (revoke, renew, rotate_ca, crl, bootstrap) is admin-only, direct-invoke.
     try:
         body = json.loads(event.get("body") or "{}")
     except json.JSONDecodeError:
@@ -122,10 +153,7 @@ def _http_handler(event):
         return _http_response(403, {"error": f"action {action!r} is not available over the HTTP endpoint"})
 
     try:
-        if action == "sign":
-            result = _sign(body)
-        else:
-            result = _revoke(body["serial"])
+        result = _sign(body)
         return _http_response(200, result)
     except KeyError as exc:
         return _http_response(400, {"error": f"missing field: {exc}"})
@@ -185,6 +213,30 @@ def _bootstrap(days):
     ca_pem = kms_ca.create_ca_certificate(CA_KEY_ID, CA_CN, CA_ORG, CA_COUNTRY, days)
     s3.put_object(Bucket=BUCKET_NAME, Key=CA_CERT_KEY, Body=ca_pem)
     return {"ca_certificate": ca_pem.decode(), "s3": f"s3://{BUCKET_NAME}/{CA_CERT_KEY}"}
+
+
+def _rotate_ca(days):
+    # Deliberately bypasses _bootstrap()'s "refuse to overwrite" guard -- this
+    # IS the overwrite, done on purpose when the current CA cert is nearing
+    # CACertValidityDays expiry. Same KMS key, so the public key (and every
+    # existing client cert's AuthorityKeyIdentifier) is unchanged; only the
+    # self-signed wrapper certificate is new.
+    if not 1 <= days <= 3650:
+        return {"error": "days must be between 1 and 3650"}
+    ca_pem = kms_ca.create_ca_certificate(CA_KEY_ID, CA_CN, CA_ORG, CA_COUNTRY, days)
+    s3.put_object(Bucket=BUCKET_NAME, Key=CA_CERT_KEY, Body=ca_pem)
+    return {
+        "ca_certificate": ca_pem.decode(),
+        "s3": f"s3://{BUCKET_NAME}/{CA_CERT_KEY}",
+        "action_required": (
+            "This new certificate is NOT yet trusted by AWS. Update the Trust "
+            "Anchor's X509CertificateData to this certificate (console: IAM "
+            "Roles Anywhere -> Trust anchors -> edit; or a CloudFormation "
+            "update) for it to take effect. Existing client certificates "
+            "remain valid once you do -- they were signed by the same KMS "
+            "key this new cert also wraps."
+        ),
+    }
 
 
 def _sign(event):
@@ -276,7 +328,58 @@ def _crl(days_valid):
     crl_number = _next_crl_number()
     crl_pem = kms_ca.build_crl(CA_KEY_ID, CA_CN, CA_ORG, CA_COUNTRY, revoked, days_valid, crl_number)
     s3.put_object(Bucket=BUCKET_NAME, Key=CRL_KEY, Body=crl_pem)
-    return {"revoked_count": len(revoked), "crl_number": crl_number, "s3": f"s3://{BUCKET_NAME}/{CRL_KEY}"}
+    registration = _register_crl_with_roles_anywhere(crl_pem)
+    return {
+        "revoked_count": len(revoked),
+        "crl_number": crl_number,
+        "s3": f"s3://{BUCKET_NAME}/{CRL_KEY}",
+        "roles_anywhere_registration": registration,
+    }
+
+
+# ── Roles Anywhere CRL registration (this is what makes revocation real) ────
+def _register_crl_with_roles_anywhere(crl_pem):
+    crl_der = _pem_to_der(crl_pem.decode())
+    existing = table.get_item(Key={"serial": CRL_ID_RECORD_KEY}).get("Item")
+    if existing and existing.get("crl_id"):
+        rolesanywhere.update_crl(crlId=existing["crl_id"], crlData=crl_der)
+        return {"action": "updated", "crl_id": existing["crl_id"]}
+
+    trust_anchor_arn = _find_trust_anchor_arn()
+    if not trust_anchor_arn:
+        return {
+            "action": "skipped",
+            "reason": (
+                "no Trust Anchor found (looked for a Roles Anywhere trust "
+                "anchor named "
+                f"'{PROJECT_NAME}-TrustAnchor'). CRL was written to S3 but "
+                "NOT registered with AWS -- revocation is not yet enforced. "
+                "Re-run 'crl' after the Trust Anchor exists."
+            ),
+        }
+    resp = rolesanywhere.import_crl(
+        name=f"{PROJECT_NAME}-crl",
+        crlData=crl_der,
+        trustAnchorArn=trust_anchor_arn,
+        enabled=True,
+    )
+    crl_id = resp.get("crlId") or resp.get("crl", {}).get("crlId")
+    table.put_item(Item={"serial": CRL_ID_RECORD_KEY, "crl_id": crl_id})
+    return {"action": "imported", "crl_id": crl_id}
+
+
+def _find_trust_anchor_arn():
+    target_name = f"{PROJECT_NAME}-TrustAnchor"
+    next_token = None
+    while True:
+        kwargs = {"nextToken": next_token} if next_token else {}
+        resp = rolesanywhere.list_trust_anchors(**kwargs)
+        for ta in resp.get("trustAnchors", []):
+            if ta.get("name") == target_name:
+                return ta.get("trustAnchorArn")
+        next_token = resp.get("nextToken")
+        if not next_token:
+            return None
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -286,6 +389,11 @@ def _s3_exists(key):
         return True
     except s3.exceptions.ClientError:
         return False
+
+
+def _pem_to_der(pem_str):
+    body = "".join(line for line in pem_str.strip().splitlines() if "-----" not in line)
+    return base64.b64decode(body)
 
 
 def _next_crl_number():

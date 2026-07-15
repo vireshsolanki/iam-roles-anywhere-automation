@@ -21,11 +21,23 @@ $1/mo; Lambda + DynamoDB + S3 are pennies at this volume).
 ## Design choices
 
 - **CA key in KMS** — the Lambda calls `kms:Sign`; the private key is
-  un-extractable and never leaves AWS.
-- **No static keys** — issuance is `aws lambda invoke`, which uses the default
-  credential chain (SSO / IAM role). The IAM permission to invoke the function
-  *is* the issuance access control. There is no API Gateway and nothing that
-  reads an access-key/secret.
+  un-extractable and never leaves AWS. The key resource itself has
+  `DeletionPolicy`/`UpdateReplacePolicy: Retain`, so deleting or replacing
+  this stack never deletes it as a side effect — actual key deletion is
+  always a separate, deliberate action. By default, **only the literal AWS
+  account root user** can ever call `kms:ScheduleKeyDeletion`/`DisableKey` on
+  it — every IAM role/user is blocked regardless of its own permissions,
+  since `aws:PrincipalArn` only equals the root ARN when authenticated as
+  root itself. Set `KeyDeletionBreakGlassArn` to swap that one exception for
+  a specific IAM principal instead, if requiring a root login is too
+  inconvenient long-term. Either way, a mandatory 30-day waiting period
+  applies to any scheduled deletion (reversible with `kms:CancelKeyDeletion`).
+- **No static keys for admin issuance** — `aws lambda invoke` uses the
+  default credential chain (SSO / IAM role). The IAM permission to invoke the
+  function *is* the issuance access control there, and nothing reads an
+  access-key/secret. (The separate public endpoint, for devs with no AWS
+  credentials at all, is API Gateway + an API key — see "Onboard a user"
+  below.)
 - **One flat stack, no zip file anywhere** — [central-ca-stack.yml](central-ca-stack.yml)
   is the only template in this directory and the only thing you deploy. The
   Lambda is 100% Python standard library (a hand-rolled DER encoder in
@@ -72,8 +84,9 @@ Five actions, one Lambda ([lambda/handler.py](lambda/handler.py)):
 | `bootstrap` | admin | Create the self-signed Root CA cert from the KMS key (once, on stack deploy). |
 | `sign` | admin, or a dev via the public endpoint | Sign a user public key → client certificate. |
 | `renew` | admin only | Issue a fresh cert for an existing identity, revoke the old one. |
-| `revoke` | admin, or a dev via the public endpoint | Mark a serial revoked in DynamoDB. |
-| `crl` | admin / schedule | Regenerate the CRL from revoked entries. |
+| `revoke` | admin only | Mark a serial revoked in DynamoDB. |
+| `crl` | admin only | Regenerate the CRL from revoked entries and register it with Roles Anywhere. |
+| `rotate_ca` | admin only | Re-self-sign a fresh Root CA cert from the same KMS key, before `CACertValidityDays` expires. |
 
 ## Stack layout
 
@@ -117,9 +130,13 @@ git push -u origin main
 2. **Stack name:** `central-ca`.
 3. **Parameters:** leave at defaults, or override `ProjectName`, `CACommonName`,
    `CACertValidityDays` (how long the Root CA cert itself lasts — default 3650
-   = 10 years, the max this stack allows), and set `ApiKeyValue` (required, no
+   = 10 years, the max this stack allows; see "Rotate the Root CA" below for
+   what to do as that approaches), and set `ApiKeyValue` (required, no
    default — the API Gateway API key devs will use; generate one with
-   `openssl rand -hex 20`).
+   `openssl rand -hex 20`). By default the CA's KMS key can only ever be
+   deleted by the literal AWS account root login — set
+   `KeyDeletionBreakGlassArn` if you'd rather that one exception be a
+   specific IAM principal instead of root (see "Design choices" above).
 4. ✅ acknowledge IAM resource creation → **Submit**.
 5. Wait for **CREATE_COMPLETE** (~1–2 min, one flat stack, no nesting).
    Everything happens automatically: fetch the code, create the CA infra,
@@ -176,11 +193,14 @@ The response body has the same shape as the admin path: `{"serial": "...", "cert
 
 **Auth is handled by API Gateway, not the Lambda** — the `/issue` method
 requires an API key, so API Gateway rejects any request without a valid
-`x-api-key` *before* the Lambda runs. **Only `sign` and `revoke` are reachable
-this way** — `bootstrap`, `renew`, and `crl` still return 403 from inside the
-Lambda even with a valid key, since those are admin-only. Anyone with the key
-can request/revoke certificates, so **rotate it** (update the stack with a new
-`ApiKeyValue`) if it ever leaks, and only share it with people you're actively
+`x-api-key` *before* the Lambda runs. **`sign` is the only action reachable
+this way** — `bootstrap`, `renew`, `revoke`, `crl`, and `rotate_ca` all
+return 403 from inside the Lambda even with a valid key, since those are
+admin-only. A dev can only ever request a certificate for themselves; they
+can't revoke or reissue anything, theirs or anyone else's. Anyone with the
+key can still request certificates under any `common_name` they like, so
+**rotate it** (update the stack with a new `ApiKeyValue`) if it ever leaks,
+and only share it with people you're actively
 onboarding.
 
 > **Why API Gateway and not a Lambda Function URL?** A Function URL with
@@ -329,6 +349,36 @@ check than this endpoint does; the admin verifying the person's identity
 out-of-band before renewing is the actual security boundary here, same as
 initial onboarding.
 
+## Rotate the Root CA (before `CACertValidityDays` runs out)
+
+`bootstrap` deliberately **refuses to overwrite** an existing CA certificate
+(`"CA certificate already exists; refusing to overwrite"`) — that's what
+makes stack updates safe (a template re-apply can never accidentally
+regenerate the CA and invalidate every certificate you've issued). The
+tradeoff: there is **no automatic renewal**. If you deployed with the default
+`CACertValidityDays: 3650` (10 years), you must manually rotate it before
+that cert expires, or every certificate this CA has ever signed stops
+chaining to a trusted root simultaneously.
+
+**Good news:** the underlying **KMS key never expires** — only the X.509
+wrapper certificate around it does. `rotate_ca` self-signs a **fresh**
+certificate from the **same** key:
+```json
+{ "action": "rotate_ca", "days": 3650 }
+```
+Because the public key is unchanged, every already-issued client certificate's
+`AuthorityKeyIdentifier` (derived from the CA's public key, not from any
+particular certificate object) still matches — existing certificates keep
+validating once you point the Trust Anchor at the new one. The response's
+`action_required` field spells out the one manual step left: update the Trust
+Anchor's `X509CertificateData` to the new certificate (**IAM Roles Anywhere
+console → Trust anchors → edit**, or a CloudFormation update). Nothing else
+changes — same KMS key, same Roles Anywhere Profile/Role bindings, same
+onboarded users.
+
+`rotate_ca` is admin-only, same reasoning as `renew` — never reachable over
+the public API endpoint.
+
 ## Revoke a user
 
 **Lambda console** → `CentralCA-issuer` → **Test** → new events:
@@ -339,12 +389,25 @@ then
 ```json
 { "action": "crl", "days": 7 }
 ```
-Then point a `AWS::RolesAnywhere::CRL` resource at the regenerated
-`s3://<artifact-bucket>/crl.pem` so AWS enforces the revocation.
+`revoke` marks the serial revoked in DynamoDB. `crl` does the part that
+actually matters: it regenerates `crl.pem`, writes it to S3, **and registers
+it with Roles Anywhere** — `rolesanywhere:ImportCrl` the first time this ever
+runs on a stack, `rolesanywhere:UpdateCrl` on every call after (the Lambda
+looks up your Trust Anchor by name and remembers the resulting `crlId` in
+DynamoDB, so you never have to pass it yourself). That registration step is
+what makes AWS actually reject the revoked certificate — writing `crl.pem` to
+S3 by itself does nothing; Roles Anywhere only enforces a CRL it has been
+explicitly told about via `ImportCrl`/`UpdateCrl`. The response includes a
+`roles_anywhere_registration` field confirming `imported` or `updated` (or
+`skipped` with a reason, if the Trust Anchor isn't found — re-run `crl` once
+it exists).
 
-Or over the public endpoint (dev self-revoking their own cert, if you want to
-allow that): `POST` the same JSON body with the `x-api-key` header to
-`ApiEndpoint` — `revoke` is one of the two actions available there.
+`revoke` is **admin-only** — it is never reachable over the public API
+endpoint, even with a valid API key. The public endpoint's only capability is
+`sign`: a dev can request their own certificate there, but can't revoke or
+reissue anything, theirs or anyone else's. Revocation always goes through the
+admin path above (`revoke`, then `crl` to actually make AWS start rejecting
+it).
 
 ## Per-user permissions (2000 users, one role)
 
@@ -382,11 +445,28 @@ issuance access control there. For the public path, the API Gateway **API key**
 (`ApiKeyValue`) is the access control instead.
 
 The `_http_handler` dispatch (action allowlisting) has been unit-tested locally
-against a real API Gateway REST-proxy event shape: `sign`/`revoke` return
-proxy-format `{statusCode, headers, body}` responses; `bootstrap`/`renew`/`crl`
-are rejected with 403 even though API Gateway would have accepted the key;
-malformed JSON returns 400; the existing admin direct-invoke path still returns
-raw dicts, and the CloudFormation custom-resource path is unaffected.
+against a real API Gateway REST-proxy event shape: `sign` returns a
+proxy-format `{statusCode, headers, body}` response; `revoke` (confirmed
+separately as still working over admin direct-invoke) plus
+`bootstrap`/`renew`/`crl`/`rotate_ca` are all rejected with 403 over HTTP even
+though API Gateway would have accepted the key — a dev can obtain a
+certificate through the public endpoint and nothing else; malformed JSON
+returns 400; the existing admin direct-invoke path still returns raw dicts,
+and the CloudFormation custom-resource path is unaffected.
+
+**Newer, not yet exercised against live AWS:** the `rolesanywhere:ImportCrl`/
+`UpdateCrl` registration inside `crl`, and `rotate_ca`. Both are unit-tested
+locally against mocked `boto3` clients — confirmed: `crl` skips registration
+gracefully with a clear reason when no Trust Anchor exists yet, correctly
+`import`s on the first real registration and caches the returned `crlId` in
+DynamoDB, correctly `update`s (not re-imports) on every call after; `rotate_ca`
+bypasses the bootstrap guard, validates its `days` argument, and returns the
+"update the Trust Anchor" instruction — but the exact request/response field
+names for `ImportCrl`/`UpdateCrl` (`crlData`, `trustAnchorArn`, etc.) are typed
+from the API's documented shape, not confirmed against a real call. First real
+`{"action":"crl", ...}` after deploying this should be checked against
+CloudWatch Logs for that Lambda to confirm the registration actually
+succeeded, same as any other newly-added AWS integration in this repo.
 
 **Deploy-endpoint note, learned the hard way:** an earlier version used a Lambda
 Function URL with `AuthType: NONE` + a resource policy granting public

@@ -84,17 +84,27 @@
 
 ### For Central CA Deployments (Production)
 
-1. **Restrict KMS key permissions**
-   ```json
-   {
-     "Sid": "AllowIssuerLambda",
-     "Effect": "Allow",
-     "Principal": { "AWS": "arn:aws:iam::ACCOUNT:role/central-ca-lambda-role" },
-     "Action": ["kms:Sign", "kms:GetPublicKey"],
-     "Resource": "*"
-   }
-   ```
-   Only the Lambda can sign; admins cannot extract the private key.
+1. **KMS key permissions, as actually shipped**
+
+   `Sign`/`GetPublicKey` access is granted to the issuer Lambda's role via a
+   separate **IAM identity-based policy** (`CALambdaRole`'s inline
+   `ca-permissions` policy, scoped to this specific key's ARN) — not via the
+   KMS key policy itself. The key policy (`CAKey`'s `KeyPolicy` property)
+   only grants broad `kms:*` to the account root, per AWS's standard
+   recommended pattern of using the key policy as a coarse root grant and
+   IAM policies for the actual fine-grained access control.
+
+   What the key policy *does* additionally restrict, out of the box: the key
+   resource has `DeletionPolicy`/`UpdateReplacePolicy: Retain` (stack
+   deletion never touches it), an explicit 30-day `PendingWindowInDays`, and
+   by default **only the literal AWS account root login** may call
+   `kms:ScheduleKeyDeletion`/`kms:DisableKey` — every IAM role/user is
+   blocked regardless of its own permissions, including
+   `AdministratorAccess`. Set `KeyDeletionBreakGlassArn` if you'd rather that
+   one exception be a specific IAM principal instead of root. See "If the
+   CA's KMS key is accidentally or maliciously deleted" below for the full
+   picture; extraction was never possible in the
+   first place (no `kms:GetPrivateKey` operation exists for asymmetric keys).
 
 2. **Protect the CloudFormation template**
    - Don't commit `central-ca-stack.yml` to a public repo without review
@@ -215,13 +225,58 @@
 
 ### If the root CA private key is compromised (Central CA)
 
-**This is very unlikely** (KMS keys are AWS-managed, un-extractable). If it happens:
+**This is very unlikely** (KMS keys are AWS-managed, un-extractable — there is
+no `kms:GetPrivateKey` operation; only `Sign`/`Verify`/`GetPublicKey` exist).
+If it happens:
 
 1. **AWS incident response** (contact AWS Support immediately)
-2. **Schedule KMS key deletion** (7–30 day waiting period)
+2. **Schedule KMS key deletion** (30-day waiting period by default in this
+   template's `PendingWindowInDays`)
 3. **Create a new KMS key** with tighter permissions
 4. **Update the stack** to point to the new key
 5. **Revoke ALL existing certs** and reissue with new key
+
+### If the CA's KMS key is accidentally or maliciously *deleted*
+
+**A different, more realistic risk than extraction.** This project restricts
+it at three independent layers:
+
+- **By default, only the literal AWS account root login** can call
+  `kms:ScheduleKeyDeletion`/`kms:DisableKey` on the key at all. The `AdminRoot`
+  statement grants broad `kms:*` to the account, but a separate `Deny`
+  statement blocks those two specific actions unless `aws:PrincipalArn`
+  matches the root ARN exactly — which is only ever true when a caller is
+  actually authenticated as root (email + password + MFA if configured), not
+  merely holding `AdministratorAccess` via some IAM role. Every IAM role or
+  user in the account is blocked from these two actions, full stop, no
+  matter how permissive its own policy is.
+- **`DeletionPolicy`/`UpdateReplacePolicy: Retain`** on the `CAKey` resource
+  means deleting or replacing the CloudFormation stack itself never touches
+  the key, for anyone — CloudFormation simply never issues the delete call
+  for that resource. This is true independently of the root-only
+  restriction above; the two don't interact, and neither makes stack
+  teardown harder.
+- **A mandatory 30-day waiting period** (`PendingWindowInDays: 30`) applies to
+  any scheduled deletion regardless of who initiates it, and is fully
+  reversible with `kms:CancelKeyDeletion` during that window.
+
+**Optional:** set the `KeyDeletionBreakGlassArn` stack parameter to swap the
+single exception from "literal root" to a specific IAM principal ARN instead
+— useful if requiring an actual root login every time is too inconvenient for
+a legitimate, planned deletion later. Don't set it to a role that won't
+reliably still exist a year from now, or you've traded "requires root" for
+"requires resurrecting a role that no longer exists."
+
+**If deletion actually completes** (30 days pass uncancelled): existing
+client certificates still cryptographically verify fine — signature
+verification only needs the public key, which is already embedded in the CA
+certificate and independent of the private key's fate. What you lose
+permanently: the ability to sign anything new. No new certificates, no
+renewals (`renew` and `rotate_ca` both need `kms:Sign`), no CRL updates. This
+is operationally equivalent to the "compromised" recovery above — new KMS
+key, new Trust Anchor, revoke and reissue for everyone — except it's a hard
+stop rather than a security race, since there's no possibility the old key is
+being actively abused in the meantime.
 
 ---
 
