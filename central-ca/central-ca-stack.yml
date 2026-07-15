@@ -105,7 +105,7 @@ Parameters:
   KeyDeletionBreakGlassArn:
     Type: String
     Default: ''
-    Description: 'Optional. If set to an IAM principal ARN (e.g. a tightly-controlled break-glass admin role), ONLY that principal may call kms:ScheduleKeyDeletion or kms:DisableKey on the CA key — blocks every other principal in the account, including anyone with AdministratorAccess. Leave blank (default) to skip this extra restriction and rely on the two protections that always apply regardless of this setting: (1) KMS enforces a mandatory 30-day waiting period before a scheduled deletion actually completes, fully reversible with kms:CancelKeyDeletion; (2) the key has DeletionPolicy/UpdateReplacePolicy Retain, so deleting or replacing this CloudFormation stack never touches the key — deletion is always a separate, deliberate action, never a side effect of "aws cloudformation delete-stack".'
+    Description: 'By default (leave blank) ONLY the literal AWS account ROOT USER may call kms:ScheduleKeyDeletion or kms:DisableKey on the CA key — every IAM role/user in the account is blocked, including anyone with AdministratorAccess, since aws:PrincipalArn only equals the root ARN when authenticated as root itself. This never affects "aws cloudformation delete-stack": the key has DeletionPolicy/UpdateReplacePolicy Retain, so CloudFormation never attempts to delete it regardless of who runs the stack deletion or what this policy says — the restriction only matters for a deliberate, separate deletion call made afterward. Set this to a specific IAM principal ARN (e.g. a break-glass admin role) to swap that single exception for something other than root, if requiring an actual root login for deletion is too inconvenient long-term. Either way: a mandatory 30-day waiting period applies to any scheduled deletion regardless of this setting, fully reversible with kms:CancelKeyDeletion.'
 
   ApiKeyValue:
     Type: String
@@ -269,20 +269,31 @@ Resources:
               AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
             Action: 'kms:*'
             Resource: '*'
-          - !If
-            - HasKeyDeletionBreakGlass
-            - Sid: DenyDeletionExceptBreakGlass
-              Effect: Deny
-              Principal:
-                AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
-              Action:
-                - kms:ScheduleKeyDeletion
-                - kms:DisableKey
-              Resource: '*'
-              Condition:
-                StringNotEquals:
-                  'aws:PrincipalArn': !Ref KeyDeletionBreakGlassArn
-            - !Ref 'AWS::NoValue'
+          # Always present. Default (KeyDeletionBreakGlassArn blank): only
+          # the literal AWS account ROOT USER can delete/disable this key --
+          # aws:PrincipalArn equals the root ARN only when authenticated as
+          # root itself, so any IAM role/user (even AdministratorAccess)
+          # resolves to ITS OWN ARN here and is blocked regardless of what
+          # its own policy grants. This does NOT affect stack deletion --
+          # DeletionPolicy: Retain above means CloudFormation never calls
+          # kms:ScheduleKeyDeletion at all, for anyone, so this restriction
+          # only ever matters for a deliberate, separate deletion call made
+          # after the fact. Set KeyDeletionBreakGlassArn to swap the single
+          # exception for a specific IAM principal instead of root.
+          - Sid: DenyDeletionExceptBreakGlass
+            Effect: Deny
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action:
+              - kms:ScheduleKeyDeletion
+              - kms:DisableKey
+            Resource: '*'
+            Condition:
+              StringNotEquals:
+                'aws:PrincipalArn': !If
+                  - HasKeyDeletionBreakGlass
+                  - !Ref KeyDeletionBreakGlassArn
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:root'
 
   CAKeyAlias:
     Type: AWS::KMS::Alias

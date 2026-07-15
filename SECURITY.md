@@ -96,12 +96,14 @@
 
    What the key policy *does* additionally restrict, out of the box: the key
    resource has `DeletionPolicy`/`UpdateReplacePolicy: Retain` (stack
-   deletion never touches it) and an explicit 30-day `PendingWindowInDays`.
-   For a hard restriction on who may ever call
-   `kms:ScheduleKeyDeletion`/`kms:DisableKey` — narrower than "anyone with
-   `AdministratorAccess`" — set the `KeyDeletionBreakGlassArn` stack
-   parameter. See "If the CA's KMS key is accidentally or maliciously
-   deleted" below for the full picture; extraction was never possible in the
+   deletion never touches it), an explicit 30-day `PendingWindowInDays`, and
+   by default **only the literal AWS account root login** may call
+   `kms:ScheduleKeyDeletion`/`kms:DisableKey` — every IAM role/user is
+   blocked regardless of its own permissions, including
+   `AdministratorAccess`. Set `KeyDeletionBreakGlassArn` if you'd rather that
+   one exception be a specific IAM principal instead of root. See "If the
+   CA's KMS key is accidentally or maliciously deleted" below for the full
+   picture; extraction was never possible in the
    first place (no `kms:GetPrivateKey` operation exists for asymmetric keys).
 
 2. **Protect the CloudFormation template**
@@ -236,26 +238,34 @@ If it happens:
 
 ### If the CA's KMS key is accidentally or maliciously *deleted*
 
-**A different, more realistic risk than extraction** — the key policy grants
-`kms:*` to the account root, so anyone with sufficiently broad IAM permissions
-(e.g. `AdministratorAccess`) can call `kms:ScheduleKeyDeletion` on it. This
-project mitigates but does not eliminate that:
+**A different, more realistic risk than extraction.** This project restricts
+it at three independent layers:
 
+- **By default, only the literal AWS account root login** can call
+  `kms:ScheduleKeyDeletion`/`kms:DisableKey` on the key at all. The `AdminRoot`
+  statement grants broad `kms:*` to the account, but a separate `Deny`
+  statement blocks those two specific actions unless `aws:PrincipalArn`
+  matches the root ARN exactly — which is only ever true when a caller is
+  actually authenticated as root (email + password + MFA if configured), not
+  merely holding `AdministratorAccess` via some IAM role. Every IAM role or
+  user in the account is blocked from these two actions, full stop, no
+  matter how permissive its own policy is.
 - **`DeletionPolicy`/`UpdateReplacePolicy: Retain`** on the `CAKey` resource
   means deleting or replacing the CloudFormation stack itself never touches
-  the key — the most common accidental-deletion path (an over-broad
-  `aws cloudformation delete-stack`) is closed off entirely.
+  the key, for anyone — CloudFormation simply never issues the delete call
+  for that resource. This is true independently of the root-only
+  restriction above; the two don't interact, and neither makes stack
+  teardown harder.
 - **A mandatory 30-day waiting period** (`PendingWindowInDays: 30`) applies to
-  any scheduled deletion, and is fully reversible with `kms:CancelKeyDeletion`
-  during that window — catch it in time and nothing is lost.
-- **Optional hard restriction:** set the `KeyDeletionBreakGlassArn` stack
-  parameter to a specific, tightly-controlled IAM principal ARN, and every
-  *other* principal in the account — including other admins — is explicitly
-  `Deny`'d from `kms:ScheduleKeyDeletion`/`kms:DisableKey`, regardless of what
-  their own IAM policy grants them. Off by default (blank), since it also
-  means *that* principal is the only one who can ever legitimately delete the
-  key later, including during a planned teardown — don't set it to a role
-  that doesn't reliably still exist a year from now.
+  any scheduled deletion regardless of who initiates it, and is fully
+  reversible with `kms:CancelKeyDeletion` during that window.
+
+**Optional:** set the `KeyDeletionBreakGlassArn` stack parameter to swap the
+single exception from "literal root" to a specific IAM principal ARN instead
+— useful if requiring an actual root login every time is too inconvenient for
+a legitimate, planned deletion later. Don't set it to a role that won't
+reliably still exist a year from now, or you've traded "requires root" for
+"requires resurrecting a role that no longer exists."
 
 **If deletion actually completes** (30 days pass uncancelled): existing
 client certificates still cryptographically verify fine — signature

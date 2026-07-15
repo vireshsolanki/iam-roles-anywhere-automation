@@ -24,10 +24,14 @@ $1/mo; Lambda + DynamoDB + S3 are pennies at this volume).
   un-extractable and never leaves AWS. The key resource itself has
   `DeletionPolicy`/`UpdateReplacePolicy: Retain`, so deleting or replacing
   this stack never deletes it as a side effect — actual key deletion is
-  always a separate, deliberate action, gated by KMS's own mandatory 30-day
-  waiting period (reversible with `kms:CancelKeyDeletion`), and optionally by
-  a break-glass IAM principal restriction (`KeyDeletionBreakGlassArn`
-  parameter, opt-in, blank by default).
+  always a separate, deliberate action. By default, **only the literal AWS
+  account root user** can ever call `kms:ScheduleKeyDeletion`/`DisableKey` on
+  it — every IAM role/user is blocked regardless of its own permissions,
+  since `aws:PrincipalArn` only equals the root ARN when authenticated as
+  root itself. Set `KeyDeletionBreakGlassArn` to swap that one exception for
+  a specific IAM principal instead, if requiring a root login is too
+  inconvenient long-term. Either way, a mandatory 30-day waiting period
+  applies to any scheduled deletion (reversible with `kms:CancelKeyDeletion`).
 - **No static keys for admin issuance** — `aws lambda invoke` uses the
   default credential chain (SSO / IAM role). The IAM permission to invoke the
   function *is* the issuance access control there, and nothing reads an
@@ -129,10 +133,10 @@ git push -u origin main
    = 10 years, the max this stack allows; see "Rotate the Root CA" below for
    what to do as that approaches), and set `ApiKeyValue` (required, no
    default — the API Gateway API key devs will use; generate one with
-   `openssl rand -hex 20`). Optionally set `KeyDeletionBreakGlassArn` to
-   restrict who can ever delete the CA's KMS key to one specific IAM
-   principal — blank by default (see "Design choices" above for what already
-   protects the key even without this).
+   `openssl rand -hex 20`). By default the CA's KMS key can only ever be
+   deleted by the literal AWS account root login — set
+   `KeyDeletionBreakGlassArn` if you'd rather that one exception be a
+   specific IAM principal instead of root (see "Design choices" above).
 4. ✅ acknowledge IAM resource creation → **Submit**.
 5. Wait for **CREATE_COMPLETE** (~1–2 min, one flat stack, no nesting).
    Everything happens automatically: fetch the code, create the CA infra,
