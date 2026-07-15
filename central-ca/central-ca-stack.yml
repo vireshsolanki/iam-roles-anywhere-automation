@@ -80,7 +80,7 @@ Parameters:
     Type: String
     Default: 'MyOrg'
     MinLength: 1
-    Description: 'The Organization (O) field of the Root CA certificate subject — typically your company or team name, e.g. "Acme Inc" or "Playto". Shown alongside the Common Name in every certificate this CA issues (both the CA cert itself and every client cert signed by it).'
+    Description: 'The Organization (O) field of the Root CA certificate subject — typically your company or team name, e.g. "Acme Inc". Shown alongside the Common Name in every certificate this CA issues (both the CA cert itself and every client cert signed by it).'
 
   CACountry:
     Type: String
