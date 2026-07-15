@@ -459,6 +459,12 @@ A: Yes — both templates are valid CloudFormation. Use `terraform`, `cdk`, or A
 
 ---
 
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for release history and what's new in each version.
+
+---
+
 ## License
 
 MIT License — see [LICENSE](LICENSE) for details.
