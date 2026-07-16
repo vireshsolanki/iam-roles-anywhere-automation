@@ -24,11 +24,16 @@
 
 ✅ **Revocation delays**  
 - Revoke a compromised cert, but it's still valid for minutes/hours while old instances of the cert circulate.
-- **This project:** AWS enforces CRL immediately (within seconds). Revoked certificates are rejected even if the client app has a cached copy.
+- **This project:** `revoke` marks the serial *and* publishes the CRL to Roles Anywhere in the same call — enforced within seconds, not merely recorded. There is no "marked revoked but still working" window to forget about. Revocation is permanent: no action flips a revoked serial back to active.
+- **Reversible suspension** (`disable`/`enable`) exists separately for planned, non-security cases — a contractor between engagements, someone on leave. AWS enforces both identically (a serial is on the CRL or it isn't); the difference is only whether it can be undone. **Don't use `disable` for suspected key compromise** — re-enabling the same keypair proves nothing new about who holds it. Use `revoke` and issue a fresh certificate.
 
 ✅ **Unauditable credential issuance**  
 - Who got credentials? When? For what identity? This should be logged.
-- **This project:** DynamoDB tracks every certificate: serial, common_name, issued_at, not_after, revoked_at, revoked_reason, renewed_from. Every action is traced.
+- **This project:** DynamoDB tracks every certificate: serial, common_name, issued_at, not_after, revoked_at, revoked_reason, disabled_at, disabled_reason, renewed_from. Every action is traced.
+
+✅ **Tampering with, or silently losing, the CA cert and CRL**  
+- The CA certificate and CRL live in S3. An overwrite (accidental or hostile) could swap the trusted cert or blank the revocation list.
+- **This project:** the artifact bucket has **versioning enabled**, so every write is recoverable rather than destructive (noncurrent versions expire after 3 days). A bucket policy **denies any non-TLS request**, and public access is fully blocked. The bucket is not the enforcement point regardless — Roles Anywhere checks the CRL that was registered with it via `ImportCrl`/`UpdateCrl`, not the S3 object.
 
 ### What This Doesn't Protect Against
 
@@ -337,11 +342,33 @@ I'll investigate, fix, and credit you in the release notes.
 
 ## Version & Dependencies
 
+**The CA itself (Lambda) — zero external dependencies:**
+
 - **Python:** 3.12 (Lambda runtime)
-- **Cryptography:** Built on standard library only (hashlib, base64)
-  - No external crypto libraries (reduces supply-chain risk)
-  - Hand-rolled X.509/DER encoder
-  - All signing via AWS KMS (private key never in code)
+- **Cryptography:** standard library only (hashlib, base64)
+  - No external crypto libraries — nothing to compromise via a package registry
+  - Hand-rolled X.509/DER encoder (`central-ca/lambda/kms_ca.py`, ~240 lines,
+    small enough to audit in full)
+  - All signing via AWS KMS (private key never in code, never extractable)
+
+**The developer client (`rolesanywhere-onboard` on PyPI) — one dependency:**
+
+- **Python:** 3.8+
+- **Depends on [`cryptography`](https://pypi.org/project/cryptography/)** for
+  local RSA keypair generation. This is a real, if small, supply-chain surface
+  the Lambda doesn't have — Python's standard library has no asymmetric keygen,
+  and the alternative (shelling out to a system `openssl`) doesn't work on
+  Windows and varies across distros. `cryptography` is the PyCA reference
+  implementation, so it's about as well-audited as this dependency gets, but it
+  is a dependency.
+  - Pin it if your threat model calls for it, or use the bash client
+    (`request-cert.sh`), which shells out to `openssl` instead.
+  - This affects **only the client**. A compromised client package could
+    exfiltrate a developer's private key at generation time; it cannot reach
+    the CA key, forge a certificate, or escalate what that certificate is
+    allowed to do.
+- **Nothing else** — no `aws` CLI, no `jq`, no AWS account. JSON and HTTP are
+  standard library.
 
 ---
 

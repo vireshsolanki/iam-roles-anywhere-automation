@@ -166,13 +166,24 @@ aws cloudformation deploy... # Deploy Trust Anchor + Profile + Role
 
 ## Quick Start
 
-### Prerequisites (Both Paths)
+### Prerequisites
+
+**Are you a developer just getting a certificate?** You need Python 3.8+ and
+nothing else — not even an AWS account:
 
 ```bash
-openssl version        # Need OpenSSL 1.1.1+
-jq --version          # Need jq for JSON parsing
-curl --version        # Need curl for HTTP
-aws --version         # Need AWS CLI v2, configured with credentials
+pip install rolesanywhere-onboard    # installs the `iamroles` command
+```
+Works on Linux, macOS, and Windows. Skip to
+[onboarding a developer](#option-2-central-ca-production) below.
+
+**Are you the admin deploying the CA?** You need:
+
+```bash
+aws --version         # AWS CLI v2, configured with credentials
+openssl version       # OpenSSL 1.1.1+   (bash client / Local CA only)
+jq --version          # jq              (bash client / Local CA only)
+curl --version        # curl            (bash client / Local CA only)
 ```
 
 ### Option 1: Local CA (Laptop)
@@ -270,14 +281,32 @@ Traditional IAM users require long-lived secret access keys — a single leak co
 
 ### Zero-Trust Developer Onboarding
 
-Central CA includes a **public HTTPS API Gateway endpoint** (API key auth, no AWS IAM required) — **issuance only**, nothing else:
+Central CA includes a **public HTTPS API Gateway endpoint** (API key auth, no AWS IAM required) — **issuance only**, nothing else. A developer's entire setup is two commands, and they never touch an AWS account:
+
+```bash
+pip install rolesanywhere-onboard
+
+iamroles --url <ApiEndpoint> --secret <ApiKeyValue> --name alice \
+  --trust-anchor-arn <arn> --profile-arn <arn> --role-arn <arn> --days 30
+
+aws sts get-caller-identity   # works immediately — writes the `default` profile
+```
+
+The private key is generated locally and never leaves the machine — only the public key is sent to the CA. To renew before expiry, re-run the same command.
+
+<details>
+<summary>Or hit the endpoint directly (any language, no dependencies)</summary>
+
 ```bash
 curl -X POST "https://api.example.com/issue" \
   -H "x-api-key: <shared-secret>" \
   -H "Content-Type: application/json" \
   -d '{"action":"sign", "common_name":"alice", "public_key":"...", "days":30}'
 ```
-Developers **never touch AWS credentials**, and this endpoint can only ever issue a certificate — not revoke, renew, disable, or reissue anything, theirs or anyone else's. Every other lifecycle action requires admin IAM credentials. Admin shares only the endpoint URL and API key.
+Returns `{"serial": "...", "certificate": "..."}`. You generate the keypair and wire up `aws_signing_helper` yourself.
+</details>
+
+This endpoint can only ever issue a certificate — not revoke, renew, disable, or reissue anything, theirs or anyone else's. Every other lifecycle action requires admin IAM credentials. Admin shares only the endpoint URL and API key.
 
 ### Cost Breakdown
 
