@@ -40,9 +40,12 @@
 #       --renew <old-serial> --trust-anchor-arn <arn> --profile-arn <arn> --role-arn <arn>
 #
 # Optional flags:
-#   --aws-profile-name <name>   Name for the ~/.aws/config profile (default:
-#                                "<client-name>-central-ca").
-#   --no-aws-profile             Skip writing to ~/.aws/config entirely.
+#   --aws-profile-name <name>   Name for the ~/.aws/config profile. If
+#                                omitted, you're prompted interactively for
+#                                one (default suggestion: "<client-name>-central-ca",
+#                                just press Enter to accept it).
+#   --no-aws-profile             Skip writing to ~/.aws/config entirely (and
+#                                skip the interactive prompt).
 #
 # If --trust-anchor-arn/--profile-arn/--role-arn are omitted, only the
 # certificate is issued (no aws_signing_helper setup) — useful if this user
@@ -51,11 +54,12 @@
 # get-credentials.sh yourself with their specific ARNs.
 #
 # Also appends a `credential_process` AWS CLI profile to ~/.aws/config (name
-# defaults to "<client-name>-central-ca", override with --aws-profile-name),
-# so you get `aws --profile <name> ...` working immediately, with the CLI
-# auto-refreshing credentials on every call — no manual export/re-run needed.
-# This ONLY ever appends a new [profile ...] block; it never edits or
-# overwrites an existing one. Skip it entirely with --no-aws-profile.
+# prompted for interactively, or set --aws-profile-name to skip the prompt
+# non-interactively — e.g. when scripting this), so you get
+# `aws --profile <name> ...` working immediately, with the CLI auto-refreshing
+# credentials on every call — no manual export/re-run needed. This ONLY ever
+# appends a new [profile ...] block; it never edits or overwrites an existing
+# one. Skip it entirely with --no-aws-profile.
 
 set -euo pipefail
 
@@ -66,6 +70,26 @@ GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
 info() { echo -e "${GREEN}[INFO]${NC} $1"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
+
+# Checks a command exists; if not, prints the right install command for the
+# current OS/package manager instead of a bare "not found" the user then has
+# to go look up themselves.
+require() {
+  local cmd="$1"
+  command -v "$cmd" &>/dev/null && return 0
+  local hint=""
+  if   command -v apt-get &>/dev/null; then hint="sudo apt-get update && sudo apt-get install -y $cmd"
+  elif command -v dnf     &>/dev/null; then hint="sudo dnf install -y $cmd"
+  elif command -v yum     &>/dev/null; then hint="sudo yum install -y $cmd"
+  elif command -v brew    &>/dev/null; then hint="brew install $cmd"
+  elif command -v apk     &>/dev/null; then hint="sudo apk add $cmd"
+  elif command -v pacman  &>/dev/null; then hint="sudo pacman -S $cmd"
+  fi
+  if [[ "$cmd" == "aws" ]]; then
+    hint="see https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html (not a package-manager install on most systems)"
+  fi
+  error "'$cmd' is not installed.$( [[ -n "$hint" ]] && echo " Install it with: $hint" )"
+}
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -84,20 +108,24 @@ while [[ $# -gt 0 ]]; do
     *) error "Unknown option: $1" ;;
   esac
 done
-[[ -n "$AWS_PROFILE_NAME" ]] || AWS_PROFILE_NAME="${NAME}-central-ca"
 [[ -n "$NAME" ]] || error "Required: --name <client-name>"
+# NAME becomes part of a directory path (./client-<NAME>) and a certificate
+# common_name -- restricting it to a safe character set closes off path
+# traversal (--name "../../etc") and keeps every downstream path/config line
+# predictable without needing to quote-escape NAME everywhere individually.
+[[ "$NAME" =~ ^[A-Za-z0-9_.-]+$ ]] || error "Invalid --name '$NAME': only letters, numbers, '.', '_', '-' allowed (no spaces or path separators)"
 if [[ -n "$LAMBDA" ]]; then
   MODE="lambda"
-  command -v aws &>/dev/null || error "aws CLI not installed (required for --lambda mode)"
+  require aws
 elif [[ -n "$URL" && -n "$SECRET" ]]; then
   MODE="url"
   [[ -z "$RENEW_SERIAL" ]] || error "Renewal is admin-only — use --lambda mode, not --url"
 else
   error "Required: either --lambda <name>  OR  --url <ApiEndpoint> --secret <ApiKeyValue>"
 fi
-command -v openssl &>/dev/null || error "openssl not installed"
-command -v jq      &>/dev/null || error "jq not installed"
-command -v curl    &>/dev/null || error "curl not installed"
+require openssl
+require jq
+require curl
 
 OUT="./client-${NAME}"
 mkdir -p "$OUT"
@@ -186,10 +214,16 @@ chmod +x "$OUT/get-credentials.sh"
 
 cat > "$OUT/test-credentials.sh" << 'EOF'
 #!/bin/bash
+# Run this with ./test-credentials.sh or bash test-credentials.sh -- NOT
+# `sh test-credentials.sh`. On Debian/Ubuntu, sh is dash, which doesn't
+# support ${BASH_SOURCE[0]} or [[ ]] and will fail with confusing errors
+# like "Bad substitution" even though the shebang above says bash.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 echo "Fetching temporary credentials..."
-CREDS=$("$SCRIPT_DIR/get-credentials.sh")
-if [[ $? -ne 0 ]]; then echo "Failed to get credentials"; exit 1; fi
+if ! CREDS=$("$SCRIPT_DIR/get-credentials.sh"); then
+  echo "Failed to get credentials"
+  exit 1
+fi
 
 export AWS_ACCESS_KEY_ID=$(echo "$CREDS"     | jq -r '.AccessKeyId')
 export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r '.SecretAccessKey')
@@ -197,15 +231,27 @@ export AWS_SESSION_TOKEN=$(echo "$CREDS"     | jq -r '.SessionToken')
 
 echo "Caller identity:"
 aws sts get-caller-identity
+
+# `aws s3 ls` with no bucket needs the account-wide s3:ListAllMyBuckets
+# permission, which a properly least-privilege role scoped to specific
+# buckets/prefixes will correctly NOT have. AccessDenied here just means
+# your policy is scoped as intended -- it doesn't mean your credentials
+# are broken. Point this at a bucket you actually have access to instead:
 echo ""
-echo "S3 buckets:"
-aws s3 ls
+echo "S3 buckets (requires s3:ListAllMyBuckets -- AccessDenied here is"
+echo "expected if your role is scoped to specific buckets, not a failure):"
+aws s3 ls || echo "  (skipped -- try: aws s3 ls s3://<your-bucket> --profile <this profile>)"
 EOF
 chmod +x "$OUT/test-credentials.sh"
 
 if [[ "$SKIP_AWS_PROFILE" == "true" ]]; then
   info "Skipping AWS CLI profile setup (--no-aws-profile given)."
 else
+  if [[ -z "$AWS_PROFILE_NAME" ]]; then
+    DEFAULT_PROFILE_NAME="${NAME}-central-ca"
+    read -rp "AWS CLI profile name to create [${DEFAULT_PROFILE_NAME}]: " AWS_PROFILE_NAME
+    [[ -n "$AWS_PROFILE_NAME" ]] || AWS_PROFILE_NAME="$DEFAULT_PROFILE_NAME"
+  fi
   AWS_CONFIG_FILE="${AWS_CONFIG_FILE:-$HOME/.aws/config}"
   mkdir -p "$(dirname "$AWS_CONFIG_FILE")"
   touch "$AWS_CONFIG_FILE"
@@ -217,7 +263,7 @@ else
     {
       echo ""
       echo "[profile ${AWS_PROFILE_NAME}]"
-      echo "credential_process = ${ABS_OUT}/aws_signing_helper credential-process --certificate ${ABS_OUT}/${NAME}-certificate.pem --private-key ${ABS_OUT}/${NAME}-private-key.pem --trust-anchor-arn ${TRUST_ANCHOR_ARN} --profile-arn ${PROFILE_ARN} --role-arn ${ROLE_ARN}"
+      echo "credential_process = \"${ABS_OUT}/aws_signing_helper\" credential-process --certificate \"${ABS_OUT}/${NAME}-certificate.pem\" --private-key \"${ABS_OUT}/${NAME}-private-key.pem\" --trust-anchor-arn \"${TRUST_ANCHOR_ARN}\" --profile-arn \"${PROFILE_ARN}\" --role-arn \"${ROLE_ARN}\""
     } >> "$AWS_CONFIG_FILE"
     info "Added profile '$AWS_PROFILE_NAME' to $AWS_CONFIG_FILE (appended only — nothing else in that file was touched)."
     echo "  Use it with: aws sts get-caller-identity --profile $AWS_PROFILE_NAME"
@@ -226,4 +272,4 @@ else
 fi
 
 info "Full pipeline complete — everything is ready in $OUT/"
-echo "  Run: cd $OUT && ./test-credentials.sh"
+echo "  Run: cd \"$OUT\" && ./test-credentials.sh"

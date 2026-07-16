@@ -204,12 +204,34 @@ cd client-alice
 1. **AWS Console** → CloudFormation → **Create stack** → Upload `central-ca/central-ca-stack.yml`
 2. Set parameters (ProjectName, CACertValidityDays, ApiKeyValue for public endpoint)
 3. Wait for `CREATE_COMPLETE` (~2 min)
-4. Use `central-ca/request-cert.sh` to onboard users (dev mode: via public API, no AWS credentials needed)
+4. Onboard users — two interchangeable clients, below.
+
+**Onboarding a developer (recommended): `pip install`, nothing else.**
+
+```bash
+pip install rolesanywhere-onboard        # installs the `iamroles` command
+
+iamroles \
+  --url <ApiEndpoint from stack outputs> \
+  --secret <ApiKeyValue you set> \
+  --name alice \
+  --trust-anchor-arn <TrustAnchorArn> \
+  --profile-arn <ProfileArn> \
+  --role-arn <RoleArn> \
+  --days 365
+
+aws sts get-caller-identity    # writes the `default` profile — no --profile flag needed
+```
+
+Needs Python 3.8+ and nothing else: no AWS account, no `aws` CLI, no
+`openssl`, no `jq`. Works on Linux, macOS, **and Windows**. Devs renew by
+re-running the same command. See
+[`central-ca/rolesanywhere-onboard/`](central-ca/rolesanywhere-onboard/).
+
+**Or the bash client** — same result, Unix-only, needs `openssl`/`jq`/`curl`:
 
 ```bash
 cd central-ca
-
-# Dev mode (no AWS credentials needed)
 ./request-cert.sh \
   --url <ApiEndpoint from stack outputs> \
   --secret <ApiKeyValue you set> \
@@ -219,9 +241,13 @@ cd central-ca
   --role-arn <RoleArn> \
   --days 365
 
-# Auto-creates AWS CLI profile: alice-central-ca
+# Prompts for an AWS CLI profile name (default: alice-central-ca)
 aws sts get-caller-identity --profile alice-central-ca
 ```
+
+Admins use `request-cert.sh --lambda` for revoke/renew/disable/rotate — those
+are IAM-authenticated and deliberately not reachable from the public endpoint
+or the pip package.
 
 ---
 
@@ -372,9 +398,15 @@ See [SECURITY.md](SECURITY.md) for detailed threat model and mitigations.
 ├── central-ca/                     ← KMS-backed CA (production)
 │   ├── README.md
 │   ├── central-ca-stack.yml        ← CloudFormation (everything auto-bootstraps)
-│   ├── request-cert.sh             ← Onboard users (admin or public endpoint)
+│   ├── request-cert.sh             ← Onboard users, bash (admin or public endpoint)
+│   ├── rolesanywhere-onboard/      ← PyPI package: `pip install` → `iamroles`
+│   │   ├── pyproject.toml          ←   dev-facing client, cross-platform
+│   │   └── src/rolesanywhere_onboard/
+│   │       ├── core.py             ←   keygen → cert → aws profile (importable)
+│   │       └── cli.py              ←   the `iamroles` command
 │   ├── lambda/
-│   │   ├── handler.py              ← Lambda (bootstrap, sign, renew, revoke, crl, rotate_ca)
+│   │   ├── handler.py              ← Lambda (bootstrap, sign, renew, revoke,
+│   │   │                              disable, enable, crl, rotate_ca)
 │   │   └── kms_ca.py               ← Hand-rolled X.509/DER encoder, KMS signing
 │   └── [generated at runtime]
 │       └── client-bob/
