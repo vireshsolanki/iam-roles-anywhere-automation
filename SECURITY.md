@@ -329,7 +329,7 @@ See [central-ca/README.md](central-ca/README.md) for DynamoDB schema and audit q
 If you discover a vulnerability in this code:
 
 1. **Do NOT open a public GitHub issue** (it alerts attackers)
-2. **Email:** vireshsolanki1157@gmail.com
+2. **Email:** vireshsolanki58@gmail.com
 3. **Include:**
    - Description of the vulnerability
    - Steps to reproduce

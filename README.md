@@ -538,7 +538,7 @@ MIT License — see [LICENSE](LICENSE) for details.
 
 - **Documentation:** See [central-ca/README.md](central-ca/README.md) for deep dives
 - **Issues:** Open a GitHub issue
-- **Security concerns:** Email vireshsolanki1157@gmail.com
+- **Security concerns:** Email vireshsolanki58@gmail.com
 
 ---
 
