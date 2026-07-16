@@ -167,22 +167,30 @@ idempotent, so updates never regenerate or invalidate the existing CA cert.
 Both ways sign the same certificate the same way; they only differ in *how the
 sign request reaches the CA*.
 
-**Prefer Python? Use [`onboard.py`](onboard.py) instead of `request-cert.sh`.**
-Same pipeline (keypair → certificate → `aws_signing_helper` → AWS CLI profile),
-but pure standard library — no `jq`, no shell-quoting to get wrong on paths
-with spaces. Works as a script or an import:
+**Prefer Python? Use [`rolesanywhere-onboard`](rolesanywhere-onboard/) instead
+of `request-cert.sh`.** Same pipeline (keypair → certificate →
+`aws_signing_helper` → AWS CLI profile), packaged for PyPI and genuinely
+cross-platform — Linux, macOS, **and Windows**, unlike the bash script. RSA
+keypair generation uses the `cryptography` package instead of shelling out to
+a system `openssl` binary (Windows doesn't ship one by default), and every
+path written to `~/.aws/config` goes through `shlex.quote`, so directory
+names with spaces can't break it the way an unquoted bash heredoc can.
+
 ```bash
-python3 onboard.py --url <ApiEndpoint> --secret <ApiKeyValue> --name alice \
+pip install rolesanywhere-onboard
+rolesanywhere-onboard --url <ApiEndpoint> --secret <ApiKeyValue> --name alice \
     --trust-anchor-arn <arn> --profile-arn <arn> --role-arn <arn> --days 365
 ```
 ```python
-from onboard import request_certificate, get_credentials
+from rolesanywhere_onboard import request_certificate, get_credentials
 result = request_certificate(url=..., secret=..., name="alice", days=365)
 creds = get_credentials(result.cert_path, result.key_path, trust_anchor_arn, profile_arn, role_arn)
 ```
-Still needs `openssl` on PATH (no pure-Python RSA keygen in the standard
-library) and, for admin/`--lambda`-equivalent mode, the `aws` CLI — everything
-else (HTTP, JSON, the resulting `~/.aws/config` entry) is stdlib only.
+Needs Python 3.13+. For admin/`--lambda`-equivalent mode specifically, the
+`aws` CLI is still required (it's a full SDK, not worth reimplementing) — the
+public `--url`/`--secret` path needs no AWS tooling or credentials at all.
+See [`rolesanywhere-onboard/README.md`](rolesanywhere-onboard/README.md) for
+the full package docs.
 
 ### A. Admin-run (`aws lambda invoke`, IAM-authenticated)
 

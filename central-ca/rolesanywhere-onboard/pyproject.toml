@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rolesanywhere-onboard"
+version = "1.0.0"
+description = "Plug-and-play client for onboarding users against a self-hosted IAM Roles Anywhere Central CA"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Viresh Solanki" }]
+requires-python = ">=3.13"
+keywords = ["aws", "iam-roles-anywhere", "certificate-authority", "x509", "pki"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security :: Cryptography",
+    "Topic :: System :: Systems Administration",
+]
+dependencies = [
+    "cryptography>=41.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/vireshsolanki/iam-roles-anywhere-automation"
+Issues = "https://github.com/vireshsolanki/iam-roles-anywhere-automation/issues"
+
+[project.scripts]
+rolesanywhere-onboard = "rolesanywhere_onboard.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
