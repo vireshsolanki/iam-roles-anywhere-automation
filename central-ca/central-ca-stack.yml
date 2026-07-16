@@ -145,6 +145,47 @@ Resources:
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          # Versioning protects ca-certificate.pem/crl.pem from accidental
+          # overwrite, but without this they'd accumulate forever. Noncurrent
+          # versions are cleaned up after 3 days -- long enough to recover
+          # from a mistake, not so long that old CRL/cert versions pile up
+          # as dead weight. Split into two rules because CloudFormation's
+          # Rule type (unlike the raw S3 API) has NO nested "Expiration"
+          # object -- ExpiredObjectDeleteMarker is a flat property on Rule,
+          # and per AWS's own docs it "cannot be specified with
+          # ExpirationInDays, ExpirationDate, or TagFilters", so it can't
+          # share a rule with NoncurrentVersionExpiration either.
+          - Id: expire-noncurrent-versions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 3
+          - Id: remove-expired-delete-markers
+            Status: Enabled
+            ExpiredObjectDeleteMarker: true
+
+  # Deny any request to this bucket that isn't over TLS -- defense in depth
+  # on top of the bucket already being fully private (PublicAccessBlock).
+  ArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyUnsecureConnections
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt ArtifactBucket.Arn
+              - !Sub '${ArtifactBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
 
   # ── Fetcher: downloads handler.py + kms_ca.py from GitHub and zips them
   # in-memory into S3. Tiny (<4096 chars), so it's inlined directly — this is
