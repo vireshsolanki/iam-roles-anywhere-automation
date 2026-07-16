@@ -167,6 +167,23 @@ idempotent, so updates never regenerate or invalidate the existing CA cert.
 Both ways sign the same certificate the same way; they only differ in *how the
 sign request reaches the CA*.
 
+**Prefer Python? Use [`onboard.py`](onboard.py) instead of `request-cert.sh`.**
+Same pipeline (keypair → certificate → `aws_signing_helper` → AWS CLI profile),
+but pure standard library — no `jq`, no shell-quoting to get wrong on paths
+with spaces. Works as a script or an import:
+```bash
+python3 onboard.py --url <ApiEndpoint> --secret <ApiKeyValue> --name alice \
+    --trust-anchor-arn <arn> --profile-arn <arn> --role-arn <arn> --days 365
+```
+```python
+from onboard import request_certificate, get_credentials
+result = request_certificate(url=..., secret=..., name="alice", days=365)
+creds = get_credentials(result.cert_path, result.key_path, trust_anchor_arn, profile_arn, role_arn)
+```
+Still needs `openssl` on PATH (no pure-Python RSA keygen in the standard
+library) and, for admin/`--lambda`-equivalent mode, the `aws` CLI — everything
+else (HTTP, JSON, the resulting `~/.aws/config` entry) is stdlib only.
+
 ### A. Admin-run (`aws lambda invoke`, IAM-authenticated)
 
 You (the admin) run this yourself, using your own AWS credentials, then hand
