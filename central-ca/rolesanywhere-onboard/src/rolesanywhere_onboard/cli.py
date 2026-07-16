@@ -1,4 +1,4 @@
-"""Console entry point -- installed as `rolesanywhere-onboard` on PATH after
+"""Console entry point -- installed as `iamroles` on PATH after
 `pip install rolesanywhere-onboard`."""
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from .core import HELPER_VERSION_DEFAULT, OnboardError, onboard
 
 def main() -> None:
     p = argparse.ArgumentParser(
-        prog="rolesanywhere-onboard",
+        prog="iamroles",
         description=(
             "Onboard a user against a self-hosted IAM Roles Anywhere Central CA: "
             "generates a local keypair, requests a signed certificate, and "
@@ -28,7 +28,9 @@ def main() -> None:
     p.add_argument("--trust-anchor-arn")
     p.add_argument("--profile-arn")
     p.add_argument("--role-arn")
-    p.add_argument("--aws-profile-name", help="~/.aws/config profile name (prompted if omitted)")
+    p.add_argument("--aws-profile-name",
+                    help="~/.aws/config profile name (default: 'default', so no --profile flag is "
+                         "needed afterwards; prompted if omitted and running interactively)")
     p.add_argument("--no-aws-profile", action="store_true", help="Skip writing to ~/.aws/config")
     p.add_argument("--helper-version", default=HELPER_VERSION_DEFAULT)
     p.add_argument("--non-interactive", action="store_true",

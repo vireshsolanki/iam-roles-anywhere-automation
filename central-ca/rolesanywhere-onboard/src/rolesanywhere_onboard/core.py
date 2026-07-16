@@ -39,6 +39,9 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 
 NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 HELPER_VERSION_DEFAULT = "1.4.0"
+# The AWS CLI's own default -- writing here means `aws s3 ls` works with no
+# --profile flag. Override per-run with --aws-profile-name.
+DEFAULT_PROFILE_NAME = "default"
 IS_WINDOWS = platform.system() == "Windows"
 
 
@@ -273,26 +276,48 @@ def _default_aws_config_path() -> Path:
     return Path.home() / ".aws" / "config"
 
 
+def _section_header(profile_name: str) -> str:
+    """AWS's config file uses two different section formats, and getting this
+    wrong silently produces a profile that doesn't work. Per AWS's docs:
+    section names are "[default]" and "[profile user1]" -- i.e. the default
+    profile is a bare "[default]", while every OTHER profile is prefixed with
+    the word "profile". Writing "[profile default]" would create a section the
+    CLI does not treat as the default."""
+    return "[default]" if profile_name == "default" else f"[profile {profile_name}]"
+
+
 def write_aws_profile(
     profile_name: str, helper_path: Path, cert_path: Path, key_path: Path,
     trust_anchor_arn: str, profile_arn: str, role_arn: str,
     config_path: Path | None = None,
 ) -> Path:
-    """Appends a [profile ...] block to ~/.aws/config. Every path/ARN is run
-    through shlex.quote -- correct POSIX shell-quoting rules, which is also
-    exactly what the AWS CLI's own credential_process line parser expects on
-    Windows (it uses the same shlex-style splitting internally, not native
+    """Appends a profile block to ~/.aws/config. Every path/ARN is run through
+    shlex.quote -- correct POSIX shell-quoting rules, which is also exactly
+    what the AWS CLI's own credential_process line parser expects on Windows
+    (it uses the same shlex-style splitting internally, not native
     cmd.exe/PowerShell quoting), so a single quoting scheme works everywhere
-    this string is actually consumed."""
+    this string is actually consumed.
+
+    Never overwrites an existing section -- if the target profile is already
+    present this raises, so an existing `default` (e.g. from `aws configure`)
+    can't be silently clobbered."""
     config_path = config_path or _default_aws_config_path()
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.touch(exist_ok=True)
 
+    header = _section_header(profile_name)
     existing = config_path.read_text() if config_path.exists() else ""
-    if f"[profile {profile_name}]" in existing:
-        raise OnboardError(
-            f"Profile '{profile_name}' already exists in {config_path} -- pick a different name"
+    # Match on a full line, not a substring: "[default]" would otherwise also
+    # match inside "[default]" of a longer name, and a bare `in` check can hit
+    # false positives in comments or values.
+    if any(line.strip() == header for line in existing.splitlines()):
+        hint = (
+            " -- you already have a default AWS profile; pass --aws-profile-name "
+            "to add this under a different name instead"
+            if profile_name == "default"
+            else " -- pick a different name with --aws-profile-name"
         )
+        raise OnboardError(f"Profile '{profile_name}' already exists in {config_path}{hint}")
 
     cmd = [
         str(helper_path.resolve()), "credential-process",
@@ -305,7 +330,7 @@ def write_aws_profile(
     credential_process_line = " ".join(shlex.quote(part) for part in cmd)
 
     with config_path.open("a") as f:
-        f.write(f"\n[profile {profile_name}]\ncredential_process = {credential_process_line}\n")
+        f.write(f"\n{header}\ncredential_process = {credential_process_line}\n")
     return config_path
 
 
@@ -336,15 +361,21 @@ def onboard(
     if write_profile:
         chosen_name = aws_profile_name
         if not chosen_name:
-            default_name = f"{name}-central-ca"
+            # "default" so plain `aws s3 ls` works with no --profile flag at
+            # all. write_aws_profile refuses to overwrite an existing section,
+            # so someone who already has a default profile gets a clear error
+            # pointing at --aws-profile-name rather than losing their config.
             if interactive and sys.stdin.isatty():
-                chosen_name = input(f"AWS CLI profile name to create [{default_name}]: ").strip() or default_name
+                chosen_name = input(f"AWS CLI profile name to create [{DEFAULT_PROFILE_NAME}]: ").strip() or DEFAULT_PROFILE_NAME
             else:
-                chosen_name = default_name
+                chosen_name = DEFAULT_PROFILE_NAME
         config_path = write_aws_profile(
             chosen_name, helper_path, result.cert_path, result.key_path,
             trust_anchor_arn, profile_arn, role_arn,
         )
         print(f"Added profile '{chosen_name}' to {config_path}")
-        print(f"  Use it with: aws sts get-caller-identity --profile {chosen_name}")
+        if chosen_name == DEFAULT_PROFILE_NAME:
+            print("  Use it with: aws sts get-caller-identity   (no --profile needed)")
+        else:
+            print(f"  Use it with: aws sts get-caller-identity --profile {chosen_name}")
     return result

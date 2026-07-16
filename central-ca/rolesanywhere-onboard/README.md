@@ -14,18 +14,39 @@ by default).
 pip install rolesanywhere-onboard
 ```
 
+The installed command is **`iamroles`** (shorter than the package name):
+
 ## CLI
 
 ```bash
-rolesanywhere-onboard --url <ApiEndpoint> --secret <ApiKeyValue> --name alice \
+iamroles --url <ApiEndpoint> --secret <ApiKeyValue> --name alice \
     --trust-anchor-arn <arn> --profile-arn <arn> --role-arn <arn> --days 365
 ```
 
 Admin mode (uses your own AWS credentials instead of a shared API key):
 ```bash
-rolesanywhere-onboard --lambda <IssuerFunctionName> --name alice \
+iamroles --lambda <IssuerFunctionName> --name alice \
     --trust-anchor-arn <arn> --profile-arn <arn> --role-arn <arn>
 ```
+
+### The AWS profile it creates
+
+By default this writes the **`default`** profile to `~/.aws/config`, so
+afterwards plain `aws s3 ls` just works — no `--profile` flag needed:
+
+```bash
+aws sts get-caller-identity
+aws s3 ls s3://your-bucket
+```
+
+If you already have a `default` profile (e.g. from `aws configure`), it will
+**not** overwrite it — you'll get an error telling you to pick a name instead:
+
+```bash
+iamroles --name alice --aws-profile-name alice-ca ...   # -> aws s3 ls --profile alice-ca
+```
+
+Skip AWS profile setup entirely with `--no-aws-profile`.
 
 ## As a library
 

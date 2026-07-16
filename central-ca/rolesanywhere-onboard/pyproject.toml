@@ -43,7 +43,10 @@ Homepage = "https://github.com/vireshsolanki/iam-roles-anywhere-automation"
 Issues = "https://github.com/vireshsolanki/iam-roles-anywhere-automation/issues"
 
 [project.scripts]
-rolesanywhere-onboard = "rolesanywhere_onboard.cli:main"
+# Deliberately shorter than the distribution name: you `pip install
+# rolesanywhere-onboard` but type `iamroles`. PyPI imposes no rule that these
+# must match.
+iamroles = "rolesanywhere_onboard.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
