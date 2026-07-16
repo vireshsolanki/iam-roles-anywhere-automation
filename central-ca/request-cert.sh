@@ -109,6 +109,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 [[ -n "$NAME" ]] || error "Required: --name <client-name>"
+# NAME becomes part of a directory path (./client-<NAME>) and a certificate
+# common_name -- restricting it to a safe character set closes off path
+# traversal (--name "../../etc") and keeps every downstream path/config line
+# predictable without needing to quote-escape NAME everywhere individually.
+[[ "$NAME" =~ ^[A-Za-z0-9_.-]+$ ]] || error "Invalid --name '$NAME': only letters, numbers, '.', '_', '-' allowed (no spaces or path separators)"
 if [[ -n "$LAMBDA" ]]; then
   MODE="lambda"
   require aws
@@ -267,4 +272,4 @@ else
 fi
 
 info "Full pipeline complete — everything is ready in $OUT/"
-echo "  Run: cd $OUT && ./test-credentials.sh"
+echo "  Run: cd \"$OUT\" && ./test-credentials.sh"
