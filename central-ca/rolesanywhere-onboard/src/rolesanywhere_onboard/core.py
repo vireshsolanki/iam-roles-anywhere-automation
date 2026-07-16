@@ -2,6 +2,13 @@
 Core onboarding pipeline: keypair -> certificate -> (optionally) AWS
 credentials via aws_signing_helper and a ready-to-use AWS CLI profile.
 
+Developer-facing only, by design. This talks to the CA's public HTTPS
+endpoint with a shared API key and nothing else -- it needs no AWS
+credentials, no `aws` CLI, and no AWS account. Issuance ("sign") is the only
+action that endpoint exposes; revoke/renew/disable/enable/crl/rotate_ca are
+admin-only, gated behind real AWS IAM credentials on a direct Lambda invoke.
+Admins use request-cert.sh for those.
+
 Cross-platform by construction, not by testing every OS:
   - Keypair generation uses the `cryptography` package (a declared PyPI
     dependency, ships prebuilt wheels for Linux/macOS/Windows across
@@ -25,7 +32,6 @@ import json
 import os
 import platform
 import re
-import tempfile
 import shlex
 import subprocess
 import sys
@@ -111,41 +117,32 @@ class CertResult:
 def request_certificate(
     *,
     name: str,
+    url: str,
+    secret: str,
     days: int = 365,
-    url: str | None = None,
-    secret: str | None = None,
-    lambda_name: str | None = None,
-    renew_serial: str | None = None,
     out_dir: str | Path | None = None,
 ) -> CertResult:
     """
-    Issues a certificate for `name`, either over the public HTTPS endpoint
-    (url + secret -- no AWS credentials needed) or via admin `aws lambda
-    invoke` (lambda_name -- uses the caller's own AWS credentials, and is the
-    only mode that supports renew_serial).
+    Issues a certificate for `name` over the CA's public HTTPS endpoint, using
+    only the shared API key -- no AWS credentials of any kind.
+
+    Issuance ("sign") is the only action the public endpoint exposes. Every
+    other lifecycle action (revoke, renew, disable/enable, crl, rotate_ca) is
+    admin-only and reachable only by direct Lambda invoke with real AWS IAM
+    credentials -- that's a deliberate boundary in the CA, not an omission
+    here. Admins have request-cert.sh for those.
     """
     _check_name(name)
-    if bool(url) != bool(secret):
-        raise OnboardError("url and secret must be given together")
-    if not url and not lambda_name:
-        raise OnboardError("Provide either (url and secret) or lambda_name")
-    if renew_serial and not lambda_name:
-        raise OnboardError("Renewal is admin-only -- use lambda_name, not url/secret")
+    if not url or not secret:
+        raise OnboardError("Both url and secret are required")
 
     out = Path(out_dir) if out_dir else Path(f"./client-{name}")
     out.mkdir(parents=True, exist_ok=True)
     key_path, pub_path = generate_keypair(out, name)
     public_key = pub_path.read_text()
 
-    if renew_serial:
-        payload = {"action": "renew", "serial": renew_serial, "public_key": public_key, "days": days}
-    else:
-        payload = {"action": "sign", "common_name": name, "public_key": public_key, "days": days}
-
-    if lambda_name:
-        response = _invoke_lambda(lambda_name, payload)
-    else:
-        response = _post_json(url, secret, payload)
+    payload = {"action": "sign", "common_name": name, "public_key": public_key, "days": days}
+    response = _post_json(url, secret, payload)
 
     if "certificate" not in response:
         raise OnboardError(f"Signing failed: {response}")
@@ -166,38 +163,6 @@ def _post_json(url: str, secret: str, payload: dict) -> dict:
             return json.loads(resp.read())
     except urllib.error.HTTPError as exc:
         return json.loads(exc.read())
-
-
-def _invoke_lambda(function_name: str, payload: dict) -> dict:
-    # Captured directly via subprocess (not written to /dev/stdout, which
-    # `outfile` is a real required filename per `aws lambda invoke help` --
-    # there's no documented "-" stdout alias, unlike some other CLI tools.
-    # tempfile.NamedTemporaryFile (delete=False + manual cleanup) is the
-    # portable way to get a private, unique temp path on every OS; /tmp
-    # itself doesn't exist on Windows, but tempfile resolves the correct
-    # per-OS temp directory automatically.
-    fd, tmp_name = tempfile.mkstemp(suffix=".json")
-    os.close(fd)
-    tmp_path = Path(tmp_name)
-    try:
-        try:
-            subprocess.run(
-                [
-                    "aws", "lambda", "invoke",
-                    "--function-name", function_name,
-                    "--payload", json.dumps(payload),
-                    "--cli-binary-format", "raw-in-base64-out",
-                    str(tmp_path),
-                ],
-                check=True, capture_output=True, text=True,
-            )
-        except FileNotFoundError:
-            raise OnboardError("'aws' CLI is not installed or not on PATH (required for lambda_name mode)")
-        except subprocess.CalledProcessError as exc:
-            raise OnboardError(f"aws lambda invoke failed: {exc.stderr.strip() or exc.stdout.strip()}")
-        return json.loads(tmp_path.read_text())
-    finally:
-        tmp_path.unlink(missing_ok=True)
 
 
 def download_signing_helper(out_dir: Path, version: str = HELPER_VERSION_DEFAULT) -> Path:
@@ -335,9 +300,7 @@ def write_aws_profile(
 
 
 def onboard(
-    *, name: str, days: int = 365,
-    url: str | None = None, secret: str | None = None, lambda_name: str | None = None,
-    renew_serial: str | None = None,
+    *, name: str, url: str, secret: str, days: int = 365,
     trust_anchor_arn: str | None = None, profile_arn: str | None = None, role_arn: str | None = None,
     aws_profile_name: str | None = None, write_profile: bool = True,
     helper_version: str = HELPER_VERSION_DEFAULT,
@@ -345,10 +308,7 @@ def onboard(
 ) -> CertResult:
     """The whole pipeline in one call: keypair -> certificate -> (optionally)
     aws_signing_helper + a ready-to-use AWS CLI profile."""
-    result = request_certificate(
-        name=name, days=days, url=url, secret=secret,
-        lambda_name=lambda_name, renew_serial=renew_serial,
-    )
+    result = request_certificate(name=name, days=days, url=url, secret=secret)
     print(f"Certificate issued. Serial: {result.serial}")
     print(f"  Private key : {result.key_path} (never left this machine)")
     print(f"  Certificate : {result.cert_path}")

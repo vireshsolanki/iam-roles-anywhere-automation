@@ -23,11 +23,13 @@ iamroles --url <ApiEndpoint> --secret <ApiKeyValue> --name alice \
     --trust-anchor-arn <arn> --profile-arn <arn> --role-arn <arn> --days 365
 ```
 
-Admin mode (uses your own AWS credentials instead of a shared API key):
-```bash
-iamroles --lambda <IssuerFunctionName> --name alice \
-    --trust-anchor-arn <arn> --profile-arn <arn> --role-arn <arn>
-```
+That's the whole tool. It needs **no AWS credentials, no `aws` CLI, and no AWS
+account** — just the endpoint URL and API key your admin gives you.
+
+Issuing a certificate is the only thing the CA's public endpoint allows.
+Revoking, renewing, suspending, and rotating the CA are admin-only actions
+gated behind real AWS IAM credentials — deliberately not reachable with an API
+key, and so deliberately not in this tool. Ask your admin for those.
 
 ### The AWS profile it creates
 
@@ -61,9 +63,13 @@ creds = get_credentials(result.cert_path, result.key_path,
 
 ## Requirements
 
-- Python 3.13+
-- The `aws` CLI, but *only* if using `--lambda` (admin) mode — the public
-  `--url`/`--secret` mode needs no AWS credentials or tooling at all.
+- Python 3.8+
+- Nothing else. No `aws` CLI, no `openssl` binary, no AWS account. The only
+  dependency is `cryptography` (pulled in automatically by pip), used for
+  local keypair generation — Python's standard library has no asymmetric
+  keygen of its own.
+
+Linux, macOS (Intel + Apple Silicon), and Windows are all supported.
 
 ## License
 
