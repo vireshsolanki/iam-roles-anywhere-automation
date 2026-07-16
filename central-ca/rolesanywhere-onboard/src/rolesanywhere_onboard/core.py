@@ -241,6 +241,27 @@ def _default_aws_config_path() -> Path:
     return Path.home() / ".aws" / "config"
 
 
+def _read_section_setting(text: str, header: str, setting: str) -> str | None:
+    """Pull one setting out of one section of an AWS config file.
+
+    Hand-rolled rather than configparser: AWS's format allows nested settings
+    (e.g. `s3 =` followed by indented sub-settings) that configparser rejects,
+    and configparser would also risk rewriting/reformatting the user's file.
+    This only reads.
+    """
+    in_section = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_section = stripped == header
+            continue
+        if in_section and "=" in stripped and not stripped.startswith("#"):
+            key, _, value = stripped.partition("=")
+            if key.strip() == setting:
+                return value.strip()
+    return None
+
+
 def _section_header(profile_name: str) -> str:
     """AWS's config file uses two different section formats, and getting this
     wrong silently produces a profile that doesn't work. Per AWS's docs:
@@ -263,26 +284,19 @@ def write_aws_profile(
     cmd.exe/PowerShell quoting), so a single quoting scheme works everywhere
     this string is actually consumed.
 
-    Never overwrites an existing section -- if the target profile is already
-    present this raises, so an existing `default` (e.g. from `aws configure`)
-    can't be silently clobbered."""
+    Never overwrites or edits an existing section. Three cases:
+      - section absent           -> append it
+      - section present, same    -> no-op (this is the renewal path: a dev
+                                    re-running to refresh an expiring cert
+                                    writes the same paths/ARNs, so there is
+                                    nothing to change and nothing to warn
+                                    about)
+      - section present, differs -> raise, so an unrelated `default` from
+                                    `aws configure` is never clobbered
+    """
     config_path = config_path or _default_aws_config_path()
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.touch(exist_ok=True)
-
-    header = _section_header(profile_name)
-    existing = config_path.read_text() if config_path.exists() else ""
-    # Match on a full line, not a substring: "[default]" would otherwise also
-    # match inside "[default]" of a longer name, and a bare `in` check can hit
-    # false positives in comments or values.
-    if any(line.strip() == header for line in existing.splitlines()):
-        hint = (
-            " -- you already have a default AWS profile; pass --aws-profile-name "
-            "to add this under a different name instead"
-            if profile_name == "default"
-            else " -- pick a different name with --aws-profile-name"
-        )
-        raise OnboardError(f"Profile '{profile_name}' already exists in {config_path}{hint}")
 
     cmd = [
         str(helper_path.resolve()), "credential-process",
@@ -293,6 +307,27 @@ def write_aws_profile(
         "--role-arn", role_arn,
     ]
     credential_process_line = " ".join(shlex.quote(part) for part in cmd)
+
+    header = _section_header(profile_name)
+    existing = config_path.read_text() if config_path.exists() else ""
+    # Match on a full line, not a substring: a bare `in` check would hit false
+    # positives inside comments, values, or longer section names.
+    if any(line.strip() == header for line in existing.splitlines()):
+        current = _read_section_setting(existing, header, "credential_process")
+        if current == credential_process_line:
+            return config_path  # already exactly right -- renewal no-op
+        if current is None:
+            detail = (
+                "it exists but isn't managed by this tool (no credential_process "
+                "setting -- probably from `aws configure`)"
+            )
+        else:
+            detail = "it exists with different settings"
+        raise OnboardError(
+            f"Profile '{profile_name}' already exists in {config_path} and {detail}. "
+            f"Pass --aws-profile-name to use a different name, or remove the "
+            f"existing {header} section first."
+        )
 
     with config_path.open("a") as f:
         f.write(f"\n{header}\ncredential_process = {credential_process_line}\n")
@@ -322,18 +357,26 @@ def onboard(
         chosen_name = aws_profile_name
         if not chosen_name:
             # "default" so plain `aws s3 ls` works with no --profile flag at
-            # all. write_aws_profile refuses to overwrite an existing section,
-            # so someone who already has a default profile gets a clear error
-            # pointing at --aws-profile-name rather than losing their config.
+            # all. write_aws_profile won't clobber an unrelated existing
+            # default (e.g. from `aws configure`) -- it raises instead.
             if interactive and sys.stdin.isatty():
                 chosen_name = input(f"AWS CLI profile name to create [{DEFAULT_PROFILE_NAME}]: ").strip() or DEFAULT_PROFILE_NAME
             else:
                 chosen_name = DEFAULT_PROFILE_NAME
+        header = _section_header(chosen_name)
+        config_path_probe = _default_aws_config_path()
+        was_present = config_path_probe.exists() and any(
+            line.strip() == header for line in config_path_probe.read_text().splitlines()
+        )
         config_path = write_aws_profile(
             chosen_name, helper_path, result.cert_path, result.key_path,
             trust_anchor_arn, profile_arn, role_arn,
         )
-        print(f"Added profile '{chosen_name}' to {config_path}")
+        if was_present:
+            print(f"Profile '{chosen_name}' in {config_path} already points here -- left unchanged.")
+            print("  Your renewed certificate is picked up automatically (same paths).")
+        else:
+            print(f"Added profile '{chosen_name}' to {config_path}")
         if chosen_name == DEFAULT_PROFILE_NAME:
             print("  Use it with: aws sts get-caller-identity   (no --profile needed)")
         else:

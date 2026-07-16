@@ -50,6 +50,28 @@ iamroles --name alice --aws-profile-name alice-ca ...   # -> aws s3 ls --profile
 
 Skip AWS profile setup entirely with `--no-aws-profile`.
 
+### Renewing before your certificate expires
+
+Just run the exact same command again:
+
+```bash
+iamroles --url <ApiEndpoint> --secret <ApiKeyValue> --name alice \
+    --trust-anchor-arn <arn> --profile-arn <arn> --role-arn <arn> --days 365
+```
+
+You get a fresh keypair and a fresh certificate, written over the old ones at
+the same paths, so your AWS profile picks them up automatically with no config
+changes — the profile write is a no-op in this case, not an error.
+
+Two things worth knowing:
+
+- **Your old certificate is not revoked.** It stays valid until it expires on
+  its own, so for a while you have two working certificates. If your old key
+  was actually compromised, don't self-renew — ask an admin to revoke it, which
+  is enforced within seconds.
+- **Renew before you expire, not after.** There's no grace period; an expired
+  certificate stops working and you'd just be onboarding fresh anyway.
+
 ## As a library
 
 ```python
