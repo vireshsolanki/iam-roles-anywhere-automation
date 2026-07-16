@@ -397,6 +397,8 @@ This is a **production-ready, tested project**. Contributions are welcome — op
 - Documentation updates
 - No direct commits to `main` (branch protection enabled)
 
+It's open source specifically so it can be useful beyond just my own setup — if you hit a bug, have a suggestion, or run into something that doesn't fit your environment, open an issue and let me know. I'll work on it. The goal is for this to hold up for anyone who needs it, not just the exact use case I originally built it for.
+
 **Development workflow:**
 ```bash
 git checkout -b feature/your-feature
