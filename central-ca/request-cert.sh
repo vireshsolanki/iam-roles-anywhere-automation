@@ -40,9 +40,12 @@
 #       --renew <old-serial> --trust-anchor-arn <arn> --profile-arn <arn> --role-arn <arn>
 #
 # Optional flags:
-#   --aws-profile-name <name>   Name for the ~/.aws/config profile (default:
-#                                "<client-name>-central-ca").
-#   --no-aws-profile             Skip writing to ~/.aws/config entirely.
+#   --aws-profile-name <name>   Name for the ~/.aws/config profile. If
+#                                omitted, you're prompted interactively for
+#                                one (default suggestion: "<client-name>-central-ca",
+#                                just press Enter to accept it).
+#   --no-aws-profile             Skip writing to ~/.aws/config entirely (and
+#                                skip the interactive prompt).
 #
 # If --trust-anchor-arn/--profile-arn/--role-arn are omitted, only the
 # certificate is issued (no aws_signing_helper setup) — useful if this user
@@ -51,11 +54,12 @@
 # get-credentials.sh yourself with their specific ARNs.
 #
 # Also appends a `credential_process` AWS CLI profile to ~/.aws/config (name
-# defaults to "<client-name>-central-ca", override with --aws-profile-name),
-# so you get `aws --profile <name> ...` working immediately, with the CLI
-# auto-refreshing credentials on every call — no manual export/re-run needed.
-# This ONLY ever appends a new [profile ...] block; it never edits or
-# overwrites an existing one. Skip it entirely with --no-aws-profile.
+# prompted for interactively, or set --aws-profile-name to skip the prompt
+# non-interactively — e.g. when scripting this), so you get
+# `aws --profile <name> ...` working immediately, with the CLI auto-refreshing
+# credentials on every call — no manual export/re-run needed. This ONLY ever
+# appends a new [profile ...] block; it never edits or overwrites an existing
+# one. Skip it entirely with --no-aws-profile.
 
 set -euo pipefail
 
@@ -66,6 +70,26 @@ GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
 info() { echo -e "${GREEN}[INFO]${NC} $1"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
+
+# Checks a command exists; if not, prints the right install command for the
+# current OS/package manager instead of a bare "not found" the user then has
+# to go look up themselves.
+require() {
+  local cmd="$1"
+  command -v "$cmd" &>/dev/null && return 0
+  local hint=""
+  if   command -v apt-get &>/dev/null; then hint="sudo apt-get update && sudo apt-get install -y $cmd"
+  elif command -v dnf     &>/dev/null; then hint="sudo dnf install -y $cmd"
+  elif command -v yum     &>/dev/null; then hint="sudo yum install -y $cmd"
+  elif command -v brew    &>/dev/null; then hint="brew install $cmd"
+  elif command -v apk     &>/dev/null; then hint="sudo apk add $cmd"
+  elif command -v pacman  &>/dev/null; then hint="sudo pacman -S $cmd"
+  fi
+  if [[ "$cmd" == "aws" ]]; then
+    hint="see https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html (not a package-manager install on most systems)"
+  fi
+  error "'$cmd' is not installed.$( [[ -n "$hint" ]] && echo " Install it with: $hint" )"
+}
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -84,20 +108,19 @@ while [[ $# -gt 0 ]]; do
     *) error "Unknown option: $1" ;;
   esac
 done
-[[ -n "$AWS_PROFILE_NAME" ]] || AWS_PROFILE_NAME="${NAME}-central-ca"
 [[ -n "$NAME" ]] || error "Required: --name <client-name>"
 if [[ -n "$LAMBDA" ]]; then
   MODE="lambda"
-  command -v aws &>/dev/null || error "aws CLI not installed (required for --lambda mode)"
+  require aws
 elif [[ -n "$URL" && -n "$SECRET" ]]; then
   MODE="url"
   [[ -z "$RENEW_SERIAL" ]] || error "Renewal is admin-only — use --lambda mode, not --url"
 else
   error "Required: either --lambda <name>  OR  --url <ApiEndpoint> --secret <ApiKeyValue>"
 fi
-command -v openssl &>/dev/null || error "openssl not installed"
-command -v jq      &>/dev/null || error "jq not installed"
-command -v curl    &>/dev/null || error "curl not installed"
+require openssl
+require jq
+require curl
 
 OUT="./client-${NAME}"
 mkdir -p "$OUT"
@@ -206,6 +229,11 @@ chmod +x "$OUT/test-credentials.sh"
 if [[ "$SKIP_AWS_PROFILE" == "true" ]]; then
   info "Skipping AWS CLI profile setup (--no-aws-profile given)."
 else
+  if [[ -z "$AWS_PROFILE_NAME" ]]; then
+    DEFAULT_PROFILE_NAME="${NAME}-central-ca"
+    read -rp "AWS CLI profile name to create [${DEFAULT_PROFILE_NAME}]: " AWS_PROFILE_NAME
+    [[ -n "$AWS_PROFILE_NAME" ]] || AWS_PROFILE_NAME="$DEFAULT_PROFILE_NAME"
+  fi
   AWS_CONFIG_FILE="${AWS_CONFIG_FILE:-$HOME/.aws/config}"
   mkdir -p "$(dirname "$AWS_CONFIG_FILE")"
   touch "$AWS_CONFIG_FILE"
