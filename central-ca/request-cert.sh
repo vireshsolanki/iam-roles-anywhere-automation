@@ -209,10 +209,16 @@ chmod +x "$OUT/get-credentials.sh"
 
 cat > "$OUT/test-credentials.sh" << 'EOF'
 #!/bin/bash
+# Run this with ./test-credentials.sh or bash test-credentials.sh -- NOT
+# `sh test-credentials.sh`. On Debian/Ubuntu, sh is dash, which doesn't
+# support ${BASH_SOURCE[0]} or [[ ]] and will fail with confusing errors
+# like "Bad substitution" even though the shebang above says bash.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 echo "Fetching temporary credentials..."
-CREDS=$("$SCRIPT_DIR/get-credentials.sh")
-if [[ $? -ne 0 ]]; then echo "Failed to get credentials"; exit 1; fi
+if ! CREDS=$("$SCRIPT_DIR/get-credentials.sh"); then
+  echo "Failed to get credentials"
+  exit 1
+fi
 
 export AWS_ACCESS_KEY_ID=$(echo "$CREDS"     | jq -r '.AccessKeyId')
 export AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r '.SecretAccessKey')
@@ -220,9 +226,16 @@ export AWS_SESSION_TOKEN=$(echo "$CREDS"     | jq -r '.SessionToken')
 
 echo "Caller identity:"
 aws sts get-caller-identity
+
+# `aws s3 ls` with no bucket needs the account-wide s3:ListAllMyBuckets
+# permission, which a properly least-privilege role scoped to specific
+# buckets/prefixes will correctly NOT have. AccessDenied here just means
+# your policy is scoped as intended -- it doesn't mean your credentials
+# are broken. Point this at a bucket you actually have access to instead:
 echo ""
-echo "S3 buckets:"
-aws s3 ls
+echo "S3 buckets (requires s3:ListAllMyBuckets -- AccessDenied here is"
+echo "expected if your role is scoped to specific buckets, not a failure):"
+aws s3 ls || echo "  (skipped -- try: aws s3 ls s3://<your-bucket> --profile <this profile>)"
 EOF
 chmod +x "$OUT/test-credentials.sh"
 
@@ -245,7 +258,7 @@ else
     {
       echo ""
       echo "[profile ${AWS_PROFILE_NAME}]"
-      echo "credential_process = ${ABS_OUT}/aws_signing_helper credential-process --certificate ${ABS_OUT}/${NAME}-certificate.pem --private-key ${ABS_OUT}/${NAME}-private-key.pem --trust-anchor-arn ${TRUST_ANCHOR_ARN} --profile-arn ${PROFILE_ARN} --role-arn ${ROLE_ARN}"
+      echo "credential_process = \"${ABS_OUT}/aws_signing_helper\" credential-process --certificate \"${ABS_OUT}/${NAME}-certificate.pem\" --private-key \"${ABS_OUT}/${NAME}-private-key.pem\" --trust-anchor-arn \"${TRUST_ANCHOR_ARN}\" --profile-arn \"${PROFILE_ARN}\" --role-arn \"${ROLE_ARN}\""
     } >> "$AWS_CONFIG_FILE"
     info "Added profile '$AWS_PROFILE_NAME' to $AWS_CONFIG_FILE (appended only — nothing else in that file was touched)."
     echo "  Use it with: aws sts get-caller-identity --profile $AWS_PROFILE_NAME"
