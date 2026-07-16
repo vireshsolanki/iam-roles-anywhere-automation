@@ -177,8 +177,8 @@ path written to `~/.aws/config` goes through `shlex.quote`, so directory
 names with spaces can't break it the way an unquoted bash heredoc can.
 
 ```bash
-pip install rolesanywhere-onboard
-rolesanywhere-onboard --url <ApiEndpoint> --secret <ApiKeyValue> --name alice \
+pip install rolesanywhere-onboard        # the installed command is `iamroles`
+iamroles --url <ApiEndpoint> --secret <ApiKeyValue> --name alice \
     --trust-anchor-arn <arn> --profile-arn <arn> --role-arn <arn> --days 365
 ```
 ```python
@@ -186,11 +186,17 @@ from rolesanywhere_onboard import request_certificate, get_credentials
 result = request_certificate(url=..., secret=..., name="alice", days=365)
 creds = get_credentials(result.cert_path, result.key_path, trust_anchor_arn, profile_arn, role_arn)
 ```
-Needs Python 3.13+. For admin/`--lambda`-equivalent mode specifically, the
-`aws` CLI is still required (it's a full SDK, not worth reimplementing) — the
-public `--url`/`--secret` path needs no AWS tooling or credentials at all.
-See [`rolesanywhere-onboard/README.md`](rolesanywhere-onboard/README.md) for
-the full package docs.
+Needs Python 3.8+ and nothing else — no `aws` CLI, no `openssl` binary, no AWS
+account. It writes the **`default`** AWS profile by default, so `aws s3 ls`
+works with no `--profile` flag afterwards (override with `--aws-profile-name`;
+an existing `default` from `aws configure` is never clobbered).
+
+The package is **developer-facing only**: issuance is the sole action the
+public endpoint exposes, so there's no `--lambda`/`--renew` there. Devs renew
+by re-running the same command (a fresh `sign`). Admins keep `request-cert.sh`
+below for revoke/renew/disable/rotate. See
+[`rolesanywhere-onboard/README.md`](rolesanywhere-onboard/README.md) for full
+package docs.
 
 ### A. Admin-run (`aws lambda invoke`, IAM-authenticated)
 

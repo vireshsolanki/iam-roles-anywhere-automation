@@ -4,6 +4,75 @@ All notable changes to this project are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); versioning follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.0] — 2026-07-16
+
+Adds a proper PyPI package for developer onboarding, hardens the artifact
+bucket, and fixes several real bugs found by actually running v1.0.0 against
+live AWS with a real developer.
+
+### Added
+
+- **`rolesanywhere-onboard` PyPI package** (`central-ca/rolesanywhere-onboard/`)
+  — installs the **`iamroles`** command. A plug-and-play replacement for
+  `request-cert.sh` for the developer-facing path, and genuinely
+  cross-platform: **Linux, macOS, and Windows**, where the bash script was
+  Unix-only.
+  - **No `jq`, no `openssl` binary, no `aws` CLI, no AWS account.** JSON and
+    HTTP are standard library; RSA keygen uses the `cryptography` package
+    (Windows ships no `openssl`); the only pip dependency is `cryptography`.
+  - Usable as a CLI *or* imported (`request_certificate`, `get_credentials`,
+    `write_aws_profile`, `onboard`) for embedding in other Python code.
+  - Developer-facing by design: issuance is the only action the CA's public
+    endpoint exposes, so there is deliberately no `--lambda`/`--renew`. Devs
+    self-renew by re-running the same command (a fresh `sign`). Admins keep
+    `request-cert.sh` for revoke/renew/disable/rotate.
+  - Writes the AWS **`default`** profile, so `aws s3 ls` works with no
+    `--profile` flag. Overridable with `--aws-profile-name`; an existing
+    `default` (e.g. from `aws configure`) is never clobbered.
+- **S3 artifact bucket hardening** — versioning enabled (so
+  `ca-certificate.pem`/`crl.pem` are recoverable rather than silently
+  overwritten), a bucket policy denying any non-TLS request, and lifecycle
+  rules expiring noncurrent versions after 3 days plus their delete markers.
+
+### Fixed
+
+- **`credential_process` paths were unquoted in `~/.aws/config`.** Any
+  directory containing a space (hit in practice with `~/Desktop/AWS Access/`)
+  produced `No such file or directory: '/home/user/Desktop/AWS'`, because the
+  AWS CLI splits that line on whitespace. Now quoted in `request-cert.sh`, and
+  built with `shlex.quote` in the package — correct by construction rather
+  than by remembering to add quotes.
+- **`--name` had no validation** in `request-cert.sh` — it becomes a directory
+  path, so `--name ../../etc` would traverse out. Now restricted to
+  `[A-Za-z0-9_.-]`.
+- **`[profile default]` vs `[default]`** — AWS's config format uses a bare
+  `[default]` for the default profile and `[profile x]` for named ones.
+  Writing `[profile default]` produces a section the CLI silently does not
+  treat as the default.
+- **Re-running to renew reported a misleading error.** The renewal succeeded
+  (new cert written to the same paths the profile already points at) but
+  ended in `Profile 'default' already exists`, telling devs to fix something
+  that wasn't broken. An identical re-run is now a no-op; only a genuine
+  conflict raises.
+- **`test-credentials.sh` treated a scoped-down role as a failure.** Its bare
+  `aws s3 ls` needs account-wide `s3:ListAllMyBuckets`, which a correctly
+  least-privilege role won't have. `AccessDenied` there means the policy is
+  working; the step is now best-effort with that explained.
+- Missing dependencies (`jq`, `curl`, `openssl`) now print the actual install
+  command for the detected package manager instead of just naming the binary.
+
+### Changed
+
+- `request-cert.sh` prompts for the AWS profile name when `--aws-profile-name`
+  is omitted, instead of silently picking one.
+
+### Notes
+
+- `rolesanywhere-onboard` **1.0.0 on PyPI was published from a stale build**
+  and has been superseded by **1.1.0**. It carries the pre-rename
+  `rolesanywhere-onboard` command rather than `iamroles`, so it is misleading
+  rather than merely outdated — 1.0.0 is yanked; install 1.1.0 or later.
+
 ## [1.0.0] — 2026-07-15
 
 First public release. Two complete, independently deployable paths to AWS IAM
