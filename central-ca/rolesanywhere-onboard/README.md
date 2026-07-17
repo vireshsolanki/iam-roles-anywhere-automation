@@ -14,7 +14,9 @@ by default).
 pip install rolesanywhere-onboard
 ```
 
-The installed command is **`iamroles`** (shorter than the package name):
+`pip install iamroles` also works — it's an alias package that pulls this one
+in, published so the name people naturally type can't be squatted by someone
+else. Either way you get the same **`iamroles`** command:
 
 ## CLI
 

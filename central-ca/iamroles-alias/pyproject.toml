@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+# Alias distribution. `iamroles` is the command the docs tell people to run, so
+# `pip install iamroles` is what they'll type -- this makes that work, and
+# claims the name so nobody else can serve something else under it. All the
+# actual code lives in rolesanywhere-onboard; this ships none of its own.
+[project]
+name = "iamroles"
+version = "1.2.1"
+description = "Alias for rolesanywhere-onboard -- installs the `iamroles` command"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Viresh Solanki" }]
+requires-python = ">=3.8"
+keywords = ["aws", "iam-roles-anywhere", "certificate-authority", "x509", "pki"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security :: Cryptography",
+    "Topic :: System :: Systems Administration",
+]
+
+# Version-pinned deliberately: an alias that floats to "whatever's latest"
+# would silently change what `pip install iamroles` gives you. Bump this in
+# lockstep with rolesanywhere-onboard.
+dependencies = [
+    "rolesanywhere-onboard==1.2.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/vireshsolanki/iam-roles-anywhere-automation"
+Issues = "https://github.com/vireshsolanki/iam-roles-anywhere-automation/issues"
+
+# No [project.scripts] here on purpose -- rolesanywhere-onboard already
+# installs the `iamroles` entry point. Declaring it again would mean two
+# distributions fighting over the same file on PATH.
+
+[tool.setuptools]
+# Ships no modules of its own; it exists purely to pull in the real package.
+py-modules = []
