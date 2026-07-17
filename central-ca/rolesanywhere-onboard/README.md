@@ -83,24 +83,61 @@ Override the location when you need to:
 
 A helper already on `PATH` is detected and reused automatically.
 
-### Production / containers / CI
+### Production / containers
 
-There's no meaningful home directory in a container, so pin both locations
-explicitly and bake the helper into the image rather than downloading it at
-runtime:
+**Most production containers should not install this package at all.**
+
+`iamroles` is an *onboarding* tool — it mints a new keypair and certificate.
+A long-running workload doesn't want that on every boot:
+
+- It would need the **API key** in the container. That key can issue a
+  certificate for *any* identity, not just this workload's — a far more
+  dangerous secret than the certificate it would fetch.
+- Every restart mints another certificate. New serial, new DynamoDB row,
+  forever. Your audit table becomes a restart log.
+- Downloading a 17MB binary at boot fights read-only root filesystems and
+  adds an AWS dependency to your startup path.
+
+**Issue the certificate once, mount it, and let the container use it.** The
+container then needs three things, and none of them is this package:
 
 ```dockerfile
+# 1. the signing helper binary
 RUN curl -fsSL -o /usr/local/bin/aws_signing_helper \
       https://rolesanywhere.amazonaws.com/releases/1.4.0/X86_64/Linux/aws_signing_helper \
  && chmod +x /usr/local/bin/aws_signing_helper
 
+# 2. an AWS config pointing at where the cert will be mounted
+RUN mkdir -p /root/.aws && printf '%s\n' \
+  '[default]' \
+  'credential_process = /usr/local/bin/aws_signing_helper credential-process --certificate /etc/rolesanywhere/svc.pem --private-key /etc/rolesanywhere/svc-key.pem --trust-anchor-arn arn:aws:rolesanywhere:...:trust-anchor/... --profile-arn arn:aws:rolesanywhere:...:profile/... --role-arn arn:aws:iam::...:role/...' \
+  > /root/.aws/config
+```
+
+```yaml
+# 3. the cert + key, mounted as secrets at runtime — never baked into the image
+volumes:
+  - name: rolesanywhere-cert
+    secret:
+      secretName: svc-rolesanywhere-cert
+      defaultMode: 0400
+```
+
+Your app then just calls AWS normally. The SDK runs `credential_process`,
+gets short-lived credentials, and refreshes them automatically — no static
+keys anywhere, and nothing in the image that could mint a new identity.
+
+**When the env vars *do* matter:** if you genuinely want a container or CI job
+to self-onboard (ephemeral runners, a bootstrap Job), then it does need this
+package — and there, pin both locations so it doesn't depend on a home
+directory that may not exist:
+
+```dockerfile
 ENV IAMROLES_DIR=/etc/rolesanywhere
 ENV IAMROLES_HELPER=/usr/local/bin/aws_signing_helper
 ```
-
-Then mount the certificate and key at `/etc/rolesanywhere/<name>/` as secrets —
-don't bake **those** into the image. Use `--non-interactive` so it never blocks
-on a prompt.
+Pass `--non-interactive` so it never blocks on a prompt, and treat the API key
+as the high-value secret it is.
 
 ### Renewing before your certificate expires
 
