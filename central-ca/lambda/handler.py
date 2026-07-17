@@ -65,8 +65,16 @@ Actions (payload {"action": ...}):
               overwrite the CA cert on its own.
 
 DynamoDB (CertTable) is the single source of truth for every certificate ever
-issued: serial, common_name, status (active/revoked), issued_at, not_after,
-and (for renewals) renewed_from linking to the serial it replaced.
+issued: serial, common_name, status (active/revoked/disabled), issued_at,
+not_after, revoked_at/revoked_reason, disabled_at/disabled_reason, and (for
+renewals) renewed_from linking to the serial it replaced.
+
+Two records in the table are internal bookkeeping rather than certificates:
+"__crl_id__" caches the Roles Anywhere CRL resource id (so publishing knows to
+UpdateCrl an existing CRL rather than ImportCrl a duplicate), and
+"__crl_number__" holds the monotonic X.509 CRL Number counter. Neither can
+collide with a real serial -- kms_ca.new_serial() only ever produces a large
+decimal integer, never a string with underscores.
 
 There are three ways this function is invoked, auto-detected from the event shape:
 
@@ -93,8 +101,8 @@ There are three ways this function is invoked, auto-detected from the event shap
      admin's own tooling (request-cert.sh --lambda, the Lambda console Test
      tab). IAM-authenticated by the caller's own credentials; no key needed
      since lambda:InvokeFunction permission on this function is itself the
-     access control. Supports all five actions, including "bootstrap",
-     "renew", and "crl" which are intentionally never exposed publicly.
+     access control. This is the ONLY path that reaches all eight actions;
+     everything except "sign" is intentionally never exposed publicly.
 
 Environment: CA_KEY_ID, TABLE_NAME, BUCKET_NAME, PROJECT_NAME, CA_CN, CA_ORG,
 CA_COUNTRY.

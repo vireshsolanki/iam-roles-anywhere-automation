@@ -33,6 +33,7 @@ import os
 import platform
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import urllib.error
@@ -49,6 +50,61 @@ HELPER_VERSION_DEFAULT = "1.4.0"
 # --profile flag. Override per-run with --aws-profile-name.
 DEFAULT_PROFILE_NAME = "default"
 IS_WINDOWS = platform.system() == "Windows"
+
+# Env-var overrides, for containers/CI where there's no meaningful home dir:
+#   IAMROLES_DIR    -- base directory for certs and the shared helper
+#   IAMROLES_HELPER -- explicit path to an aws_signing_helper binary
+ENV_BASE_DIR = "IAMROLES_DIR"
+ENV_HELPER = "IAMROLES_HELPER"
+
+
+def base_dir() -> Path:
+    """Where certs and the shared helper live.
+
+    Deliberately NOT relative to the current directory. An earlier version
+    defaulted to ./client-<name>, which meant the output landed wherever the
+    user happened to be standing -- in practice, someone's ~/Downloads. They
+    then (reasonably) moved it somewhere sensible, which broke every profile
+    pointing at it, because credential_process paths must be absolute (the AWS
+    CLI invokes them from arbitrary working directories, so a relative path
+    would resolve against whatever tool is asking for credentials).
+
+    Resolution order: $IAMROLES_DIR, then the platform's conventional
+    per-user config location.
+    """
+    if os.environ.get(ENV_BASE_DIR):
+        return Path(os.environ[ENV_BASE_DIR]).expanduser()
+    if IS_WINDOWS:
+        local = os.environ.get("LOCALAPPDATA")
+        if local:
+            return Path(local) / "rolesanywhere"
+        return Path.home() / "AppData" / "Local" / "rolesanywhere"
+    if os.environ.get("XDG_CONFIG_HOME"):
+        return Path(os.environ["XDG_CONFIG_HOME"]) / "rolesanywhere"
+    return Path.home() / ".config" / "rolesanywhere"
+
+
+def client_dir(name: str) -> Path:
+    """Per-identity directory holding that identity's key + certificate."""
+    _check_name(name)
+    return base_dir() / name
+
+
+def shared_helper_path() -> Path:
+    """One aws_signing_helper for every identity on this machine.
+
+    The binary is ~17MB and identical for every client, so downloading a copy
+    per identity (as this once did) wastes both bandwidth and disk for no
+    benefit. Resolution order: $IAMROLES_HELPER, then one already on PATH,
+    then the shared copy under base_dir().
+    """
+    if os.environ.get(ENV_HELPER):
+        return Path(os.environ[ENV_HELPER]).expanduser()
+    on_path = shutil.which("aws_signing_helper")
+    if on_path:
+        return Path(on_path)
+    name = "aws_signing_helper.exe" if IS_WINDOWS else "aws_signing_helper"
+    return base_dir() / "bin" / name
 
 
 class OnboardError(Exception):
@@ -136,7 +192,7 @@ def request_certificate(
     if not url or not secret:
         raise OnboardError("Both url and secret are required")
 
-    out = Path(out_dir) if out_dir else Path(f"./client-{name}")
+    out = Path(out_dir).expanduser() if out_dir else client_dir(name)
     out.mkdir(parents=True, exist_ok=True)
     key_path, pub_path = generate_keypair(out, name)
     public_key = pub_path.read_text()
@@ -165,7 +221,19 @@ def _post_json(url: str, secret: str, payload: dict) -> dict:
         return json.loads(exc.read())
 
 
-def download_signing_helper(out_dir: Path, version: str = HELPER_VERSION_DEFAULT) -> Path:
+def ensure_signing_helper(version: str = HELPER_VERSION_DEFAULT, dest: Path | None = None) -> Path:
+    """Return a usable aws_signing_helper, downloading it only if needed.
+
+    Shared across every identity on the machine rather than copied per-client
+    (it's ~17MB and byte-identical each time). If $IAMROLES_HELPER is set or a
+    helper is already on PATH, that one is used and nothing is downloaded --
+    which is how you'd wire this up in a container image or on a server with
+    the binary baked in at /usr/local/bin.
+    """
+    helper_path = Path(dest).expanduser() if dest else shared_helper_path()
+    if helper_path.exists():
+        return helper_path
+
     system = platform.system()
     machine = platform.machine()
     arch_map = {
@@ -181,12 +249,10 @@ def download_signing_helper(out_dir: Path, version: str = HELPER_VERSION_DEFAULT
                 "X86_64 aws_signing_helper build for Linux"
             )
         url = f"https://rolesanywhere.amazonaws.com/releases/{version}/X86_64/Linux/aws_signing_helper"
-        filename = "aws_signing_helper"
     elif system == "Darwin":
         if arch not in ("X86_64", "ARM64"):
             raise OnboardError(f"Unsupported macOS arch: {machine!r}")
         url = f"https://rolesanywhere.amazonaws.com/releases/{version}/{arch}/Darwin/aws_signing_helper"
-        filename = "aws_signing_helper"
     elif system == "Windows":
         if arch != "X86_64":
             raise OnboardError(
@@ -194,15 +260,26 @@ def download_signing_helper(out_dir: Path, version: str = HELPER_VERSION_DEFAULT
                 "X86_64 aws_signing_helper build for Windows"
             )
         url = f"https://rolesanywhere.amazonaws.com/releases/{version}/X86_64/Windows/aws_signing_helper.exe"
-        filename = "aws_signing_helper.exe"
     else:
         raise OnboardError(f"Unsupported platform: {system!r}")
 
-    helper_path = out_dir / filename
-    urllib.request.urlretrieve(url, helper_path)
+    helper_path.parent.mkdir(parents=True, exist_ok=True)
+    # Download to a temp name in the same directory, then atomically rename.
+    # A half-written 17MB binary left behind by an interrupted download would
+    # otherwise satisfy the exists() check above forever and fail at run time.
+    tmp = helper_path.with_suffix(helper_path.suffix + ".partial")
+    urllib.request.urlretrieve(url, tmp)
     if not IS_WINDOWS:
-        os.chmod(helper_path, 0o755)  # +x -- meaningless on Windows, .exe is already executable
+        os.chmod(tmp, 0o755)  # +x -- meaningless on Windows, .exe is already executable
+    tmp.replace(helper_path)
     return helper_path
+
+
+# Back-compat alias: this was the name before the helper became shared.
+def download_signing_helper(out_dir: Path, version: str = HELPER_VERSION_DEFAULT) -> Path:
+    return ensure_signing_helper(version=version, dest=Path(out_dir) / (
+        "aws_signing_helper.exe" if IS_WINDOWS else "aws_signing_helper"
+    ))
 
 
 def get_credentials(
@@ -339,11 +416,12 @@ def onboard(
     trust_anchor_arn: str | None = None, profile_arn: str | None = None, role_arn: str | None = None,
     aws_profile_name: str | None = None, write_profile: bool = True,
     helper_version: str = HELPER_VERSION_DEFAULT,
+    out_dir: str | Path | None = None,
     interactive: bool = True,
 ) -> CertResult:
     """The whole pipeline in one call: keypair -> certificate -> (optionally)
     aws_signing_helper + a ready-to-use AWS CLI profile."""
-    result = request_certificate(name=name, days=days, url=url, secret=secret)
+    result = request_certificate(name=name, days=days, url=url, secret=secret, out_dir=out_dir)
     print(f"Certificate issued. Serial: {result.serial}")
     print(f"  Private key : {result.key_path} (never left this machine)")
     print(f"  Certificate : {result.cert_path}")
@@ -352,7 +430,10 @@ def onboard(
         print("No trust_anchor_arn/profile_arn/role_arn given -- skipping AWS credential setup.")
         return result
 
-    helper_path = download_signing_helper(result.out_dir, helper_version)
+    existing_helper = shared_helper_path()
+    reused = existing_helper.exists()
+    helper_path = ensure_signing_helper(helper_version)
+    print(f"  Signing helper: {helper_path}" + ("  (reused)" if reused else "  (downloaded)"))
     if write_profile:
         chosen_name = aws_profile_name
         if not chosen_name:

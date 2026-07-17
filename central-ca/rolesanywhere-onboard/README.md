@@ -50,6 +50,58 @@ iamroles --name alice --aws-profile-name alice-ca ...   # -> aws s3 ls --profile
 
 Skip AWS profile setup entirely with `--no-aws-profile`.
 
+### Where things are stored
+
+Nothing is written relative to your current directory — it doesn't matter where
+you run `iamroles` from:
+
+```
+~/.config/rolesanywhere/
+├── bin/aws_signing_helper       ← one 17MB copy, shared by every identity
+├── alice/
+│   ├── alice-private-key.pem    ← never leaves this machine
+│   └── alice-certificate.pem
+└── bob/
+    └── ...
+```
+
+**Don't move these directories.** The `credential_process` line in
+`~/.aws/config` stores absolute paths, and it has to: the AWS CLI (and
+`kubectl`, and every SDK) invokes it from whatever directory *they* happen to
+be in, so a relative path would resolve somewhere unpredictable. Moving the
+files breaks the profile with a confusing `[Errno 2] No such file or
+directory`. If you must move them, update the paths in `~/.aws/config` to
+match, or just re-run `iamroles`.
+
+Override the location when you need to:
+
+| | |
+|---|---|
+| `--out-dir PATH` | where this identity's key + cert go |
+| `$IAMROLES_DIR` | base dir for everything (default `~/.config/rolesanywhere`) |
+| `$IAMROLES_HELPER` | use an existing helper binary; skips the 17MB download |
+
+A helper already on `PATH` is detected and reused automatically.
+
+### Production / containers / CI
+
+There's no meaningful home directory in a container, so pin both locations
+explicitly and bake the helper into the image rather than downloading it at
+runtime:
+
+```dockerfile
+RUN curl -fsSL -o /usr/local/bin/aws_signing_helper \
+      https://rolesanywhere.amazonaws.com/releases/1.4.0/X86_64/Linux/aws_signing_helper \
+ && chmod +x /usr/local/bin/aws_signing_helper
+
+ENV IAMROLES_DIR=/etc/rolesanywhere
+ENV IAMROLES_HELPER=/usr/local/bin/aws_signing_helper
+```
+
+Then mount the certificate and key at `/etc/rolesanywhere/<name>/` as secrets —
+don't bake **those** into the image. Use `--non-interactive` so it never blocks
+on a prompt.
+
 ### Renewing before your certificate expires
 
 Just run the exact same command again:
