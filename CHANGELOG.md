@@ -4,6 +4,85 @@ All notable changes to this project are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/); versioning follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.2.0] — 2026-07-17
+
+Fixes a storage-layout flaw that broke a real developer's setup, closes a
+typosquatting hole, and refuses to leak the API key over plaintext HTTP.
+Package: `rolesanywhere-onboard` **1.2.0** (also installable as `iamroles`).
+
+### Fixed
+
+- **Certificates were written relative to the current directory.** The client
+  defaulted to `./client-<name>`, so wherever you happened to be standing is
+  where your production credentials landed — in practice, someone's
+  `~/Downloads`. Moving them somewhere sensible then broke the AWS profile with
+  a `[Errno 2] No such file or directory`, surfaced through `kubectl` as the
+  thoroughly unhelpful `executable aws failed with exit code 255`.
+  Certificates now go to a **stable per-user location**
+  (`~/.config/rolesanywhere/<name>/`, XDG-aware, `%LOCALAPPDATA%` on Windows) —
+  the same answer regardless of where the command runs from.
+  The absolute paths in `~/.aws/config` are *not* the bug and remain absolute:
+  `credential_process` is invoked by the AWS CLI, `kubectl`, and every SDK from
+  their own working directories, so a relative path would resolve
+  unpredictably.
+- **`--url http://...` would have sent the API key in cleartext.** There was no
+  scheme check. That key mints certificates for *any* identity, making it worth
+  more than any certificate it issues. Now a hard error — API Gateway is
+  HTTPS-only, so no legitimate plaintext endpoint exists.
+- **An interrupted helper download left a truncated binary** that satisfied the
+  "already downloaded" check forever and then failed at run time. Downloads now
+  write to a `.partial` file and atomically rename.
+- **`handler.py`'s docstring had drifted** — claimed "all five actions" (there
+  are eight) and `status (active/revoked)` (missing `disabled`).
+
+### Added
+
+- **`iamroles` on PyPI** — an alias package that installs
+  `rolesanywhere-onboard`. The docs tell people to run `iamroles`, so
+  `pip install iamroles` is what they type; the name was unregistered and could
+  have been claimed by anyone to serve arbitrary code to people installing a
+  key-handling tool. Ships no code, pins the real package exactly, declares no
+  entry point of its own.
+- **One shared `aws_signing_helper`** instead of a 17MB copy per identity (this
+  machine had accumulated three, ~51MB, one in `.Trash`). A helper already on
+  `PATH` or named by `$IAMROLES_HELPER` is reused and nothing is downloaded.
+- **`IAMROLES_DIR` / `IAMROLES_HELPER` / `--out-dir`** for containers and CI,
+  where there may be no usable home directory.
+
+### Security
+
+- Verified rather than assumed, and documented in `SECURITY.md`:
+  TLS certificates and hostnames **are** validated by default (checked against
+  `expired.badssl.com`); `--helper-version` **cannot** redirect the download off
+  AWS's host (a path component can't rewrite the authority — tested with
+  traversal, `@`-injection, and percent-encoding); there is no
+  `eval`/`exec`/`shell=True` anywhere, and nothing from the CA's response is
+  executed.
+- **Stated the one accepted risk plainly:** the helper binary is downloaded,
+  marked executable, and run with **no checksum verification** — AWS publishes
+  none. HTTPS plus a hardcoded host is the entire defense. Blast radius is
+  bounded to the developer's own private key; it cannot reach the CA's KMS key
+  or forge certificates. Production guidance is to pin a verified copy via
+  `IAMROLES_HELPER`.
+- **Corrected a false claim in `SECURITY.md`:** "No external crypto libraries
+  (reduces supply-chain risk)" was presented project-wide. Still true of the
+  Lambda; not true of the client, which depends on `cryptography` for keygen.
+
+### Changed
+
+- **Production guidance rewritten.** The previous advice was incoherent — it
+  said to bake in the helper, set the env vars, *and* mount a pre-issued
+  certificate, but if the certificate is mounted the container never runs
+  `iamroles` and those env vars do nothing. Now split by the actual decision:
+  long-running workloads should **not install this package at all** (mount a
+  certificate; shipping the API key into a container is a much larger secret to
+  hold, and every restart would mint another certificate); only genuinely
+  self-onboarding jobs need it.
+- Root `README.md` prerequisites split by audience — they previously demanded
+  `openssl`, `jq`, `curl`, and the AWS CLI under "Both Paths", none of which the
+  pip client needs, implying a developer needs an AWS account to get a
+  certificate.
+
 ## [1.1.0] — 2026-07-16
 
 Adds a proper PyPI package for developer onboarding, hardens the artifact

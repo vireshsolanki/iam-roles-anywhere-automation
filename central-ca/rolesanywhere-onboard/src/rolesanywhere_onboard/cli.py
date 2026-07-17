@@ -11,10 +11,21 @@ from .core import HELPER_VERSION_DEFAULT, OnboardError, onboard
 def main() -> None:
     p = argparse.ArgumentParser(
         prog="iamroles",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
         description=(
             "Onboard a user against a self-hosted IAM Roles Anywhere Central CA: "
             "generates a local keypair, requests a signed certificate, and "
             "(optionally) sets up an AWS CLI profile backed by aws_signing_helper."
+        ),
+        epilog=(
+            "Environment variables (useful in containers/CI, where there's no\n"
+            "meaningful home directory):\n"
+            "  IAMROLES_DIR     base dir for certs and the shared signing helper\n"
+            "                   (default: ~/.config/rolesanywhere)\n"
+            "  IAMROLES_HELPER  path to an existing aws_signing_helper binary;\n"
+            "                   set this (or put one on PATH) to skip the 17MB\n"
+            "                   download entirely -- e.g. baked into an image\n"
+            "                   at /usr/local/bin/aws_signing_helper\n"
         ),
     )
     p.add_argument("--name", required=True, help="Client identity / common_name")
@@ -28,6 +39,11 @@ def main() -> None:
                     help="~/.aws/config profile name (default: 'default', so no --profile flag is "
                          "needed afterwards; prompted if omitted and running interactively)")
     p.add_argument("--no-aws-profile", action="store_true", help="Skip writing to ~/.aws/config")
+    p.add_argument("--out-dir", metavar="PATH",
+                    help="Where to write the key + certificate. Default: a stable "
+                         "per-user location (~/.config/rolesanywhere/<name>/), NOT "
+                         "the current directory -- so it doesn't matter where you "
+                         "run this from. Override the base with $IAMROLES_DIR.")
     p.add_argument("--helper-version", default=HELPER_VERSION_DEFAULT)
     p.add_argument("--non-interactive", action="store_true",
                     help="Never prompt (use defaults for anything not given as a flag)")
@@ -39,7 +55,7 @@ def main() -> None:
             trust_anchor_arn=args.trust_anchor_arn, profile_arn=args.profile_arn,
             role_arn=args.role_arn, aws_profile_name=args.aws_profile_name,
             write_profile=not args.no_aws_profile, helper_version=args.helper_version,
-            interactive=not args.non_interactive,
+            out_dir=args.out_dir, interactive=not args.non_interactive,
         )
     except OnboardError as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)

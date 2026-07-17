@@ -42,8 +42,14 @@
 - **Mitigation:** Use fine-grained IAM policies (least-privilege), monitor CloudTrail, rotate roles regularly.
 
 ❌ **Shared API key leaks (Central CA public endpoint)**  
-- If the shared secret (API key for public cert requests) is leaked, anyone can request certificates.
-- **Mitigation:** Use strong random keys (20+ chars), rotate regularly if suspected leak, restrict network access (VPC endpoints, IP whitelisting).
+- If the shared secret (API key for public cert requests) is leaked, anyone can request certificates — **for any identity, not just their own**. The key is strictly more valuable than any certificate it issues, so treat it as the higher-value secret of the two.
+- **Mitigation:** Use strong random keys (20+ chars), rotate regularly if suspected leak, restrict network access (VPC endpoints, IP whitelisting). The `iamroles` client refuses any non-`https://` endpoint outright, so the key can't be sent in cleartext by a typo or a copy-pasted URL.
+- **Don't ship the key into long-running containers** just so they can self-onboard — mount a pre-issued certificate instead. See `central-ca/rolesanywhere-onboard/README.md` → Production.
+
+❌ **A compromised `aws_signing_helper` binary**  
+- The client downloads AWS's `aws_signing_helper` over HTTPS from `rolesanywhere.amazonaws.com`, marks it executable, and runs it. TLS certificate and hostname verification are on (Python's default), and the download host is hardcoded — neither `--helper-version` nor any server response can redirect it elsewhere. But there is **no checksum or signature verification** of the binary itself, because AWS does not publish one for it.
+- **Blast radius if AWS's distribution were compromised:** the binary handles the developer's private key, so it could exfiltrate it. It cannot reach the CA's KMS key or issue certificates.
+- **Mitigation:** in production, download the helper once, verify it out-of-band, and pin it into your image — then set `IAMROLES_HELPER` (or put it on `PATH`) so nothing is fetched at run time.
 
 ❌ **Admin credential compromise**  
 - If an AWS admin's credentials are stolen, attacker can modify the CA configuration (change validity, policies, profiles).
