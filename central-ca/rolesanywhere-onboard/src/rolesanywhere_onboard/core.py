@@ -37,6 +37,7 @@ import shutil
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,7 +46,12 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
 NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+# Interpolated into the download URL. It can't escape the AWS host (a path
+# can't rewrite the authority), but validating keeps the URL well-formed and
+# the failure mode obvious.
+HELPER_VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 HELPER_VERSION_DEFAULT = "1.4.0"
+HELPER_HOST = "rolesanywhere.amazonaws.com"
 # The AWS CLI's own default -- writing here means `aws s3 ls` works with no
 # --profile flag. Override per-run with --aws-profile-name.
 DEFAULT_PROFILE_NAME = "default"
@@ -208,13 +214,34 @@ def request_certificate(
     return CertResult(serial=str(response["serial"]), cert_path=cert_path, key_path=key_path, out_dir=out)
 
 
+def _require_https(url: str) -> None:
+    """Refuse to send the API key over anything but TLS.
+
+    The key is sent as an x-api-key header, and it can mint a certificate for
+    ANY identity -- it's a far more valuable secret than any single
+    certificate. Over http:// it would cross the network in cleartext to
+    anyone on the path. There is no legitimate reason to point this at a
+    non-HTTPS endpoint (API Gateway is HTTPS-only), so this is a hard error
+    rather than a warning.
+    """
+    scheme = urllib.parse.urlparse(url).scheme.lower()
+    if scheme != "https":
+        raise OnboardError(
+            f"--url must be https:// (got {scheme or 'no'} scheme). The API key is sent "
+            "as a header and would be readable by anyone on the network path."
+        )
+
+
 def _post_json(url: str, secret: str, payload: dict) -> dict:
+    _require_https(url)
     body = json.dumps(payload).encode()
     req = urllib.request.Request(
         url, data=body, method="POST",
         headers={"Content-Type": "application/json", "x-api-key": secret},
     )
     try:
+        # urllib verifies TLS certs and hostnames by default (CERT_REQUIRED +
+        # check_hostname), so this is not silently downgradeable.
         with urllib.request.urlopen(req) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as exc:
@@ -233,6 +260,8 @@ def ensure_signing_helper(version: str = HELPER_VERSION_DEFAULT, dest: Path | No
     helper_path = Path(dest).expanduser() if dest else shared_helper_path()
     if helper_path.exists():
         return helper_path
+    if not HELPER_VERSION_RE.match(version):
+        raise OnboardError(f"Invalid helper version {version!r}: expected N.N.N (e.g. 1.4.0)")
 
     system = platform.system()
     machine = platform.machine()
